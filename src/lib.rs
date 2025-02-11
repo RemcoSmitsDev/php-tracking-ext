@@ -1,5 +1,6 @@
 use ext_php_rs::{prelude::*, zend::ExecuteData};
 use lazy_static::lazy_static;
+use serde::Serialize;
 use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::sync::{
@@ -17,7 +18,7 @@ extern "C" {
 
 type StackId = u64;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct FunctionCall {
     line: u32,
     name: String,
@@ -25,10 +26,11 @@ struct FunctionCall {
     duration: Duration,
     file: Option<String>,
     namespace: Option<String>,
+    #[serde(skip)]
     parent_stack_id: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct MethodCall {
     line: u32,
     name: String,
@@ -37,10 +39,12 @@ struct MethodCall {
     file: Option<String>,
     stack_id: u64,
     duration: Duration,
+    #[serde(skip)]
     parent_stack_id: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "lowercase", tag = "type")]
 enum CallType {
     Function(FunctionCall),
     Method(MethodCall),
@@ -139,7 +143,8 @@ pub unsafe extern "C" fn custom_execute_ex(execute_data: *mut ExecuteData) {
             _ => return,
         };
 
-        if let Ok(mut calls) = FUNCTION_CALLS.lock() {
+        {
+            let mut calls = FUNCTION_CALLS.lock().unwrap();
             calls.push(CallType::Method(MethodCall {
                 name: function_name,
                 duration: elapsed,
@@ -159,7 +164,8 @@ pub unsafe extern "C" fn custom_execute_ex(execute_data: *mut ExecuteData) {
             _ => return,
         };
 
-        if let Ok(mut calls) = FUNCTION_CALLS.lock() {
+        {
+            let mut calls = FUNCTION_CALLS.lock().unwrap();
             calls.push(CallType::Function(FunctionCall {
                 line,
                 name: function_name,
@@ -210,30 +216,6 @@ fn print_call_tree(calls: &[CallType], parent_id: Option<u64>, level: usize) {
     }
 }
 
-// fn write_call_tree_to_file(
-//     calls: &[FunctionCall],
-//     parent_id: Option<u64>,
-//     level: usize,
-//     file: &mut std::fs::File,
-// ) -> std::io::Result<()> {
-//     use std::io::Write;
-
-//     for call in calls.iter().filter(|c| c.parent_stack_id == parent_id) {
-//         writeln!(
-//             file,
-//             "{:indent$}└─ {} ({}ms) [{}:{}]",
-//             "",
-//             call.name,
-//             call.duration.as_millis(),
-//             call.file.clone().unwrap_or_default(),
-//             call.line,
-//             indent = level * 2
-//         )?;
-//         write_call_tree_to_file(calls, Some(call.stack_id), level + 1, file)?;
-//     }
-//     Ok(())
-// }
-
 #[no_mangle]
 pub extern "C" fn request_startup(_type: i32, _module: i32) -> i32 {
     *REQUEST_START_TIME.lock().unwrap() = Some(Instant::now());
@@ -255,7 +237,7 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
 
     let duration = start.elapsed();
     println!(
-        "\nRequest completed in: {:?} total stacks {:?}",
+        "\nRequest completed in: {:?}\nTotal function/method calls {:?}",
         duration,
         STACK_ID_COUNTER.load(Ordering::SeqCst)
     );
@@ -263,19 +245,18 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
     // Print call tree
     let calls = FUNCTION_CALLS.lock().unwrap();
 
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open("call_tree.json")
+    {
+        serde_json::to_writer_pretty(&mut file, &calls.clone()).unwrap();
+    }
+
     if cfg!(debug_assertions) {
         println!("\nFunction call tree:");
         print_call_tree(&calls, Some(0), 0);
-    } else {
-        // if let Ok(mut file) = std::fs::OpenOptions::new()
-        //     .write(true)
-        //     .create(true)
-        //     .truncate(true)
-        //     .open("/Users/remcosmits/Documents/code/php-tracking/call_tree.txt")
-        // {
-        //     println!("\nFunction call tree:");
-        //     // write_call_tree_to_file(&calls, None, 0, &mut file).unwrap();
-        // }
     }
 
     // Calculate total time in functions

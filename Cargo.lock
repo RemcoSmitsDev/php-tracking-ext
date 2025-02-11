@@ -1251,6 +1251,7 @@ dependencies = [
  "ext-php-rs",
  "lazy_static",
  "reqwest",
+ "serde",
  "serde_json",
 ]
 
