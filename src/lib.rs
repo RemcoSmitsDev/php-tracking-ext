@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use ext_php_rs::types::Zval;
 use ext_php_rs::{prelude::*, zend::ExecuteData};
 use lazy_static::lazy_static;
@@ -25,7 +26,7 @@ static mut ORIGINAL_EXECUTE_INTERNAL: ZendExecuteFuncInternal = None;
 // Static storage for execution times and original execute_ex
 lazy_static! {
     static ref FUNCTION_CALLS: Mutex<Vec<CallType>> = Mutex::new(Vec::new());
-    static ref REQUEST_START_TIME: Mutex<Option<Instant>> = Mutex::new(None);
+    static ref REQUEST_START_TIME: Mutex<Option<DateTime<Utc>>> = Mutex::new(None);
     static ref CALL_STACK: Mutex<VecDeque<StackId>> = Mutex::new(Default::default());
     static ref STACK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 }
@@ -37,12 +38,12 @@ struct FunctionCall {
     line: Option<u32>,
     name: String,
     stack_id: u64,
+    timestamp: i64,
     internal: bool,
     duration: Duration,
-    file: Option<String>,
+    parent_stack_id: u64,
+    filename: Option<String>,
     namespace: Option<String>,
-    #[serde(skip)]
-    parent_stack_id: Option<u64>,
     arguments: Vec<ArgumentType>,
 }
 
@@ -52,12 +53,12 @@ struct MethodCall {
     name: String,
     internal: bool,
     stack_id: u64,
+    timestamp: i64,
     classname: String,
     duration: Duration,
     file: Option<String>,
+    parent_stack_id: u64,
     namespace: Option<String>,
-    #[serde(skip)]
-    parent_stack_id: Option<u64>,
     arguments: Vec<ArgumentType>,
 }
 
@@ -120,9 +121,9 @@ pub unsafe extern "C" fn custom_execute_external(execute_data: *mut ExecuteData)
     let parent_stack_id = {
         let mut call_stack = CALL_STACK.lock().unwrap();
         let parent_id = if call_stack.is_empty() {
-            None
+            0
         } else {
-            Some(*call_stack.back().unwrap())
+            *call_stack.back().unwrap()
         };
         call_stack.push_back(stack_id);
         parent_id
@@ -207,6 +208,7 @@ pub unsafe extern "C" fn custom_execute_external(execute_data: *mut ExecuteData)
                 line: Some(line),
                 duration: elapsed,
                 name: function_name,
+                timestamp: chrono::Utc::now().timestamp(),
             }));
         }
     } else {
@@ -220,7 +222,7 @@ pub unsafe extern "C" fn custom_execute_external(execute_data: *mut ExecuteData)
         {
             let mut calls = FUNCTION_CALLS.lock().unwrap();
             calls.push(CallType::Function(FunctionCall {
-                file,
+                filename: file,
                 stack_id,
                 namespace,
                 arguments,
@@ -229,6 +231,7 @@ pub unsafe extern "C" fn custom_execute_external(execute_data: *mut ExecuteData)
                 line: Some(line),
                 duration: elapsed,
                 name: function_name,
+                timestamp: chrono::Utc::now().timestamp(),
             }));
         }
     }
@@ -273,9 +276,9 @@ extern "C" fn custom_execute_internal(
     let parent_stack_id = {
         let mut call_stack = CALL_STACK.lock().unwrap();
         let parent_id = if call_stack.is_empty() {
-            None
+            0
         } else {
-            Some(*call_stack.back().unwrap())
+            *call_stack.back().unwrap()
         };
         call_stack.push_back(stack_id);
         parent_id
@@ -317,6 +320,7 @@ extern "C" fn custom_execute_internal(
                 parent_stack_id,
                 duration: elapsed,
                 name: function_name,
+                timestamp: chrono::Utc::now().timestamp(),
             }));
         }
     } else {
@@ -326,18 +330,19 @@ extern "C" fn custom_execute_internal(
                 stack_id,
                 arguments,
                 line: None,
-                file: None,
+                filename: None,
                 internal: true,
                 namespace: None,
                 parent_stack_id,
                 duration: elapsed,
                 name: function_name,
+                timestamp: chrono::Utc::now().timestamp(),
             }));
         }
     }
 }
 
-fn print_call_tree(calls: &[CallType], parent_id: Option<u64>, level: usize) {
+fn print_call_tree(calls: &[CallType], parent_id: u64, level: usize) {
     for call in calls.iter().filter(|c| match c {
         CallType::Function(c) => c.parent_stack_id == parent_id,
         CallType::Method(c) => c.parent_stack_id == parent_id,
@@ -350,11 +355,11 @@ fn print_call_tree(calls: &[CallType], parent_id: Option<u64>, level: usize) {
                     call.namespace.clone().unwrap_or_default(),
                     call.name,
                     call.duration.as_millis(),
-                    call.file.clone().unwrap_or_default(),
+                    call.filename.clone().unwrap_or_default(),
                     call.line.unwrap_or_default(),
                     indent = level * 2
                 );
-                print_call_tree(calls, Some(call.stack_id), level + 1);
+                print_call_tree(calls, call.stack_id, level + 1);
             }
             CallType::Method(call) => {
                 println!(
@@ -368,7 +373,7 @@ fn print_call_tree(calls: &[CallType], parent_id: Option<u64>, level: usize) {
                     call.line.unwrap_or_default(),
                     indent = level * 2
                 );
-                print_call_tree(calls, Some(call.stack_id), level + 1);
+                print_call_tree(calls, call.stack_id, level + 1);
             }
         }
     }
@@ -376,7 +381,7 @@ fn print_call_tree(calls: &[CallType], parent_id: Option<u64>, level: usize) {
 
 #[no_mangle]
 pub extern "C" fn request_startup(_type: i32, _module: i32) -> i32 {
-    *REQUEST_START_TIME.lock().unwrap() = Some(Instant::now());
+    *REQUEST_START_TIME.lock().unwrap() = Some(chrono::Utc::now());
 
     if let Ok(mut calls) = FUNCTION_CALLS.lock() {
         calls.clear();
@@ -391,31 +396,64 @@ pub extern "C" fn request_startup(_type: i32, _module: i32) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
-    let start = REQUEST_START_TIME.lock().unwrap().clone().unwrap();
+    use reqwest::blocking;
 
-    let duration = start.elapsed();
+    let start_timestamp = REQUEST_START_TIME.lock().unwrap().clone().unwrap();
+    let end_timestamp = chrono::Utc::now();
+
+    let duration = end_timestamp.signed_duration_since(start_timestamp);
+    let total_micros = duration.num_microseconds().unwrap();
+    let seconds = total_micros / 1_000_000;
+    let millis = (total_micros % 1_000_000) / 1_000;
+    let micros = total_micros % 1_000;
     println!(
-        "\nRequest completed in: {:?}\nTotal function/method calls {:?}",
-        duration,
+        "\nRequest completed in: {}s {}ms {}µs\nTotal function/method calls {:?}",
+        seconds,
+        millis,
+        micros,
         STACK_ID_COUNTER.load(Ordering::SeqCst)
     );
 
     // Print call tree
     let calls = FUNCTION_CALLS.lock().unwrap();
 
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open("call_tree.json")
-    {
-        serde_json::to_writer_pretty(&mut file, &calls.clone()).unwrap();
+    let client = blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+
+    #[derive(Serialize)]
+    struct CreateRequest {
+        start_timestamp: DateTime<Utc>,
+        end_timestamp: DateTime<Utc>,
+        callstack: Vec<CallType>,
+        url: Option<String>,
     }
 
-    if cfg!(debug_assertions) {
-        println!("\nFunction call tree:");
-        print_call_tree(&calls, Some(0), 0);
-    }
+    client
+        .post("http://localhost:3000/requests")
+        .json(&CreateRequest {
+            start_timestamp,
+            end_timestamp,
+            callstack: calls.clone(),
+            url: Some("https://my-application.nl/api/v1/users".to_owned()),
+        })
+        .send()
+        .unwrap();
+
+    // if let Ok(mut file) = std::fs::OpenOptions::new()
+    //     .write(true)
+    //     .create(true)
+    //     .truncate(true)
+    //     .open("call_tree.json")
+    // {
+    //     serde_json::to_writer_pretty(&mut file, &calls.clone()).unwrap();
+    // }
+
+    // if cfg!(debug_assertions) {
+    //     println!("\nFunction call tree:");
+    //     print_call_tree(&calls, 0, 0);
+    // }
 
     // Calculate total time in functions
     let total_function_time: Duration = calls
@@ -430,7 +468,8 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
     println!(
         "\nTotal time in functions: {:?} ({:.2}% of request)",
         total_function_time,
-        (total_function_time.as_nanos() as f64 / duration.as_nanos() as f64) * 100.0
+        (total_function_time.as_nanos() as f64 / duration.num_nanoseconds().unwrap() as f64)
+            * 100.0
     );
 
     0
