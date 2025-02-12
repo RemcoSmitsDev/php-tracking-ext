@@ -1,3 +1,4 @@
+use ext_php_rs::types::Zval;
 use ext_php_rs::{prelude::*, zend::ExecuteData};
 use lazy_static::lazy_static;
 use serde::Serialize;
@@ -42,6 +43,7 @@ struct FunctionCall {
     namespace: Option<String>,
     #[serde(skip)]
     parent_stack_id: Option<u64>,
+    arguments: Vec<ArgumentType>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -56,6 +58,7 @@ struct MethodCall {
     namespace: Option<String>,
     #[serde(skip)]
     parent_stack_id: Option<u64>,
+    arguments: Vec<ArgumentType>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,10 +68,53 @@ enum CallType {
     Method(MethodCall),
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "lowercase", tag = "type", content = "value")]
+enum ArgumentType {
+    String(String),
+    Int(i64),
+    Bool(bool),
+    Object(String), // debug presentation
+}
+
+unsafe fn get_function_arguments(execute_data: *mut ExecuteData) -> Vec<ArgumentType> {
+    let mut args: Vec<ArgumentType> = Vec::new();
+
+    let actual_num_args = (*execute_data).This.u2.num_args as usize;
+    let stack_top = execute_data.offset(1) as *mut Zval;
+
+    if stack_top.is_null() {
+        return args;
+    }
+
+    for i in 0..actual_num_args {
+        let arg_ptr = stack_top.offset(i as isize);
+
+        if arg_ptr.is_null() {
+            continue;
+        }
+
+        let arg = &*arg_ptr;
+        if let Some(arg) = arg.string() {
+            args.push(ArgumentType::String(arg));
+        } else if let Some(arg) = arg.long() {
+            args.push(ArgumentType::Int(arg));
+        } else if let Some(arg) = arg.bool() {
+            args.push(ArgumentType::Bool(arg));
+        } else {
+            args.push(ArgumentType::Object(format!("{:?}", arg)));
+        }
+    }
+
+    args
+}
+
 /// Custom execute_ex function for tracking
 #[no_mangle]
 pub unsafe extern "C" fn custom_execute_external(execute_data: *mut ExecuteData) {
     let stack_id = STACK_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+
+    let arguments = get_function_arguments(execute_data);
 
     // Get parent stack ID and depth
     let parent_stack_id = {
@@ -102,9 +148,11 @@ pub unsafe extern "C" fn custom_execute_external(execute_data: *mut ExecuteData)
         return;
     }
 
-    let execute_data = unsafe { &*execute_data };
+    let Some(execute_data_ref) = (unsafe { execute_data.as_ref() }) else {
+        return;
+    };
 
-    let Some(func) = execute_data.function() else {
+    let Some(func) = execute_data_ref.function() else {
         return;
     };
 
@@ -149,15 +197,16 @@ pub unsafe extern "C" fn custom_execute_external(execute_data: *mut ExecuteData)
         {
             let mut calls = FUNCTION_CALLS.lock().unwrap();
             calls.push(CallType::Method(MethodCall {
-                name: function_name,
-                duration: elapsed,
-                stack_id,
-                parent_stack_id,
                 file,
-                line: Some(line),
+                stack_id,
                 classname,
+                arguments,
                 namespace,
+                parent_stack_id,
                 internal: false,
+                line: Some(line),
+                duration: elapsed,
+                name: function_name,
             }));
         }
     } else {
@@ -171,14 +220,15 @@ pub unsafe extern "C" fn custom_execute_external(execute_data: *mut ExecuteData)
         {
             let mut calls = FUNCTION_CALLS.lock().unwrap();
             calls.push(CallType::Function(FunctionCall {
-                line: Some(line),
-                name: function_name,
-                stack_id,
-                duration: elapsed,
                 file,
+                stack_id,
                 namespace,
+                arguments,
                 parent_stack_id,
                 internal: false,
+                line: Some(line),
+                duration: elapsed,
+                name: function_name,
             }));
         }
     }
@@ -190,6 +240,34 @@ extern "C" fn custom_execute_internal(
     return_value: *mut ext_php_rs::ffi::zend_value,
 ) {
     let stack_id = STACK_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+
+    if execute_data.is_null() {
+        return;
+    }
+
+    let Some(execute_data_ref) = (unsafe { execute_data.as_ref() }) else {
+        return;
+    };
+
+    let Some(func) = execute_data_ref.function() else {
+        return;
+    };
+
+    let Some(name_ptr) = (unsafe { func.internal_function.function_name.as_ref() }) else {
+        return;
+    };
+
+    let function_name = unsafe {
+        CStr::from_ptr(name_ptr.val.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    let arguments = unsafe { get_function_arguments(execute_data) };
+
+    let scope = unsafe { func.internal_function.scope.as_ref() }
+        .and_then(|scope| scope.name())
+        .map(|scope| scope.to_owned());
 
     // Get parent stack ID
     let parent_stack_id = {
@@ -218,30 +296,6 @@ extern "C" fn custom_execute_internal(
         call_stack.pop_back();
     }
 
-    if execute_data.is_null() {
-        return;
-    }
-
-    let execute_data = unsafe { &*execute_data };
-
-    let Some(func) = execute_data.function() else {
-        return;
-    };
-
-    let Some(name_ptr) = (unsafe { func.internal_function.function_name.as_ref() }) else {
-        return;
-    };
-
-    let function_name = unsafe {
-        CStr::from_ptr(name_ptr.val.as_ptr())
-            .to_string_lossy()
-            .into_owned()
-    };
-
-    let scope = unsafe { func.internal_function.scope.as_ref() }
-        .and_then(|scope| scope.name())
-        .map(|scope| scope.to_owned());
-
     if let Some(scope) = scope {
         let parts: Vec<&str> = scope.rsplitn(2, '\\').collect();
         let (classname, namespace) = match parts.as_slice() {
@@ -253,29 +307,31 @@ extern "C" fn custom_execute_internal(
         {
             let mut calls = FUNCTION_CALLS.lock().unwrap();
             calls.push(CallType::Method(MethodCall {
-                name: function_name,
-                duration: elapsed,
                 stack_id,
-                parent_stack_id,
-                file: None,
-                line: None,
                 classname,
                 namespace,
+                arguments,
+                file: None,
+                line: None,
                 internal: true,
+                parent_stack_id,
+                duration: elapsed,
+                name: function_name,
             }));
         }
     } else {
         {
             let mut calls = FUNCTION_CALLS.lock().unwrap();
             calls.push(CallType::Function(FunctionCall {
-                line: None,
-                name: function_name,
                 stack_id,
-                duration: elapsed,
+                arguments,
+                line: None,
                 file: None,
+                internal: true,
                 namespace: None,
                 parent_stack_id,
-                internal: true,
+                duration: elapsed,
+                name: function_name,
             }));
         }
     }
