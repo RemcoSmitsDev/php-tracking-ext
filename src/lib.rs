@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use ext_php_rs::ffi::ZEND_INTERNAL_FUNCTION;
-use ext_php_rs::flags::FunctionType;
 use ext_php_rs::types::Zval;
 use ext_php_rs::{prelude::*, zend::ExecuteData};
 use lazy_static::lazy_static;
@@ -16,7 +15,8 @@ use std::time::{Duration, Instant};
 lazy_static! {
     static ref FUNCTION_CALLS: Mutex<Vec<CallType>> = Mutex::new(Vec::new());
     static ref REQUEST_START_TIME: Mutex<Option<DateTime<Utc>>> = Mutex::new(None);
-    static ref CALL_STACK: Mutex<VecDeque<StackId>> = Mutex::new(Default::default());
+    static ref ACTIVE_CALLS: Mutex<VecDeque<(StackId, DateTime<Utc>, Instant)>> =
+        Mutex::new(VecDeque::new());
     static ref STACK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 }
 
@@ -44,8 +44,8 @@ struct MethodCall {
     stack_id: u64,
     classname: String,
     duration: Duration,
-    file: Option<String>,
     parent_stack_id: u64,
+    filename: Option<String>,
     timestamp: DateTime<Utc>,
     namespace: Option<String>,
     arguments: Vec<ArgumentType>,
@@ -67,87 +67,9 @@ enum ArgumentType {
     Object(String), // debug presentation
 }
 
-unsafe fn get_function_arguments(execute_data: *mut ExecuteData) -> Vec<ArgumentType> {
-    let mut args: Vec<ArgumentType> = Vec::new();
-
-    let actual_num_args = (*execute_data).This.u2.num_args as usize;
-    let stack_top = execute_data.offset(1) as *mut Zval;
-
-    if stack_top.is_null() {
-        return args;
-    }
-
-    for i in 0..actual_num_args {
-        let arg_ptr = stack_top.offset(i as isize);
-
-        if arg_ptr.is_null() {
-            continue;
-        }
-
-        let arg = &*arg_ptr;
-        if let Some(arg) = arg.string() {
-            args.push(ArgumentType::String(arg));
-        } else if let Some(arg) = arg.long() {
-            args.push(ArgumentType::Int(arg));
-        } else if let Some(arg) = arg.bool() {
-            args.push(ArgumentType::Bool(arg));
-        } else {
-            args.push(ArgumentType::Object(format!("{:?}", arg)));
-        }
-    }
-
-    args
-}
-
-#[cfg(debug_assertions)]
-fn print_call_tree(calls: &[CallType], parent_id: u64, level: usize) {
-    for call in calls.iter().filter(|c| match c {
-        CallType::Function(c) => c.parent_stack_id == parent_id,
-        CallType::Method(c) => c.parent_stack_id == parent_id,
-    }) {
-        match call {
-            CallType::Function(call) => {
-                println!(
-                    "{:indent$}└─ {}::{} ({}ms) [{}:{}]",
-                    "",
-                    call.namespace.clone().unwrap_or_default(),
-                    call.name,
-                    call.duration.as_millis(),
-                    call.filename.clone().unwrap_or_default(),
-                    call.line.unwrap_or_default(),
-                    indent = level * 2
-                );
-                print_call_tree(calls, call.stack_id, level + 1);
-            }
-            CallType::Method(call) => {
-                println!(
-                    "{:indent$}└─ {}{}::{} ({}ms) [{}:{}]",
-                    "",
-                    call.namespace.clone().unwrap_or_default(),
-                    call.classname.clone(),
-                    call.name,
-                    call.duration.as_millis(),
-                    call.file.clone().unwrap_or_default(),
-                    call.line.unwrap_or_default(),
-                    indent = level * 2
-                );
-                print_call_tree(calls, call.stack_id, level + 1);
-            }
-        }
-    }
-}
-
 #[no_mangle]
 pub extern "C" fn request_startup(_type: i32, _module: i32) -> i32 {
     *REQUEST_START_TIME.lock().unwrap() = Some(chrono::Utc::now());
-
-    if let Ok(mut calls) = FUNCTION_CALLS.lock() {
-        calls.clear();
-    }
-    if let Ok(mut call_stack) = CALL_STACK.lock() {
-        call_stack.clear();
-    }
-    STACK_ID_COUNTER.store(0, Ordering::SeqCst);
 
     0
 }
@@ -230,15 +152,20 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
 
     println!("\nTotal time in functions: {:?} ", duration);
 
+    if let Ok(mut calls) = FUNCTION_CALLS.lock() {
+        calls.clear();
+    }
+    if let Ok(mut call_stack) = ACTIVE_CALLS.lock() {
+        call_stack.clear();
+    }
+    STACK_ID_COUNTER.store(0, Ordering::SeqCst);
+
     0
 }
 
 //
 // observer
 //
-
-static ACTIVE_CALLS: Mutex<VecDeque<(StackId, DateTime<Utc>, Instant)>> =
-    Mutex::new(VecDeque::new());
 
 // Define function pointer types for Zend observer handlers
 type ZendObserverFcallBeginHandler = extern "C" fn(*mut ExecuteData);
@@ -292,6 +219,22 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
         return;
     };
 
+    let (filename, line) = {
+        let op_array = unsafe { func.op_array };
+        if !op_array.filename.is_null() {
+            (
+                Some(unsafe {
+                    CStr::from_ptr((*op_array.filename).val.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
+                }),
+                Some(op_array.line_start),
+            )
+        } else {
+            (None, None)
+        }
+    };
+
     let function_name = unsafe {
         CStr::from_ptr(name_ptr.val.as_ptr())
             .to_string_lossy()
@@ -305,20 +248,13 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
         .map(|scope| scope.to_owned());
 
     // Get parent stack ID
-    let parent_stack_id = {
-        let mut call_stack = CALL_STACK.lock().unwrap();
-        let parent_id = if call_stack.is_empty() {
-            0
-        } else {
-            *call_stack.back().unwrap()
-        };
-        call_stack.push_back(stack_id);
-        parent_id
+    let parent_stack_id = if let Ok(mut active_calls) = ACTIVE_CALLS.lock() {
+        let id = active_calls.back().map(|stack| stack.0).unwrap_or(0);
+        active_calls.pop_back();
+        id
+    } else {
+        0
     };
-
-    if let Ok(mut call_stack) = CALL_STACK.lock() {
-        call_stack.pop_back();
-    }
 
     if let Some(scope) = scope {
         let parts: Vec<&str> = scope.rsplitn(2, '\\').collect();
@@ -331,12 +267,12 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
         {
             let mut calls = FUNCTION_CALLS.lock().unwrap();
             calls.push(CallType::Method(MethodCall {
+                line,
                 stack_id,
                 classname,
                 namespace,
                 arguments,
-                file: None,
-                line: None,
+                filename,
                 parent_stack_id,
                 duration: elapsed,
                 name: function_name,
@@ -348,10 +284,10 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
         {
             let mut calls = FUNCTION_CALLS.lock().unwrap();
             calls.push(CallType::Function(FunctionCall {
+                line,
                 stack_id,
                 arguments,
-                line: None,
-                filename: None,
+                filename,
                 namespace: None,
                 parent_stack_id,
                 duration: elapsed,
@@ -386,4 +322,74 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
     module
         .request_startup_function(request_startup)
         .request_shutdown_function(request_shutdown)
+}
+
+unsafe fn get_function_arguments(execute_data: *mut ExecuteData) -> Vec<ArgumentType> {
+    let mut args: Vec<ArgumentType> = Vec::new();
+
+    let actual_num_args = (*execute_data).This.u2.num_args as usize;
+    let stack_top = execute_data.offset(1) as *mut Zval;
+
+    if stack_top.is_null() {
+        return args;
+    }
+
+    for i in 0..actual_num_args {
+        let arg_ptr = stack_top.offset(i as isize);
+
+        if arg_ptr.is_null() {
+            continue;
+        }
+
+        let arg = &*arg_ptr;
+        if let Some(arg) = arg.string() {
+            args.push(ArgumentType::String(arg));
+        } else if let Some(arg) = arg.long() {
+            args.push(ArgumentType::Int(arg));
+        } else if let Some(arg) = arg.bool() {
+            args.push(ArgumentType::Bool(arg));
+        } else {
+            args.push(ArgumentType::Object(format!("{:?}", arg)));
+        }
+    }
+
+    args
+}
+
+#[cfg(debug_assertions)]
+fn print_call_tree(calls: &[CallType], parent_id: u64, level: usize) {
+    for call in calls.iter().filter(|c| match c {
+        CallType::Function(c) => c.parent_stack_id == parent_id,
+        CallType::Method(c) => c.parent_stack_id == parent_id,
+    }) {
+        match call {
+            CallType::Function(call) => {
+                println!(
+                    "{:indent$}└─ {}::{} ({}ms) [{}:{}]",
+                    "",
+                    call.namespace.clone().unwrap_or_default(),
+                    call.name,
+                    call.duration.as_millis(),
+                    call.filename.clone().unwrap_or_default(),
+                    call.line.unwrap_or_default(),
+                    indent = level * 2
+                );
+                print_call_tree(calls, call.stack_id, level + 1);
+            }
+            CallType::Method(call) => {
+                println!(
+                    "{:indent$}└─ {}{}::{} ({}ms) [{}:{}]",
+                    "",
+                    call.namespace.clone().unwrap_or_default(),
+                    call.classname.clone(),
+                    call.name,
+                    call.duration.as_millis(),
+                    call.filename.clone().unwrap_or_default(),
+                    call.line.unwrap_or_default(),
+                    indent = level * 2
+                );
+                print_call_tree(calls, call.stack_id, level + 1);
+            }
+        }
+    }
 }
