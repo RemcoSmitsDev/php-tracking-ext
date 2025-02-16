@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use ext_php_rs::ffi::ZEND_INTERNAL_FUNCTION;
+use ext_php_rs::flags::DataType;
 use ext_php_rs::types::Zval;
 use ext_php_rs::{prelude::*, zend::ExecuteData};
 use lazy_static::lazy_static;
@@ -61,10 +62,18 @@ enum CallType {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "lowercase", tag = "type", content = "value")]
 enum ArgumentType {
-    String(String),
-    Int(i64),
+    Array(String),
     Bool(bool),
-    Object(String), // debug presentation
+    Callable(String),
+    Float(f64),
+    Int(i64),
+    Iterable(String),
+    Mixed(String),
+    Null,
+    Object(String),
+    String(String),
+    Undefined,
+    Void,
 }
 
 #[no_mangle]
@@ -341,15 +350,64 @@ unsafe fn get_function_arguments(execute_data: *mut ExecuteData) -> Vec<Argument
             continue;
         }
 
-        let arg = &*arg_ptr;
-        if let Some(arg) = arg.string() {
-            args.push(ArgumentType::String(arg));
-        } else if let Some(arg) = arg.long() {
-            args.push(ArgumentType::Int(arg));
-        } else if let Some(arg) = arg.bool() {
-            args.push(ArgumentType::Bool(arg));
-        } else {
-            args.push(ArgumentType::Object(format!("{:?}", arg)));
+        let Some(arg) = arg_ptr.as_ref() else {
+            continue;
+        };
+
+        match arg.get_type() {
+            DataType::String => {
+                if let Some(s) = arg.string() {
+                    args.push(ArgumentType::String(s));
+                }
+            }
+            DataType::Long => {
+                if let Some(i) = arg.long() {
+                    args.push(ArgumentType::Int(i));
+                }
+            }
+            DataType::Double => {
+                if let Some(f) = arg.double() {
+                    args.push(ArgumentType::Float(f));
+                }
+            }
+            DataType::True | DataType::False | DataType::Bool => {
+                if let Some(b) = arg.bool() {
+                    args.push(ArgumentType::Bool(b));
+                }
+            }
+            DataType::Iterable => {
+                if let Some(i) = arg.iterable() {
+                    args.push(ArgumentType::Iterable(format!("{:?}", i)));
+                }
+            }
+            DataType::Array => {
+                if let Some(a) = arg.array() {
+                    args.push(ArgumentType::Array(format!("{:?}", a)));
+                }
+            }
+            DataType::Undef => args.push(ArgumentType::Undefined),
+            DataType::Null => args.push(ArgumentType::Null),
+            DataType::Object(_) => {
+                if let Some(o) = arg.object() {
+                    args.push(ArgumentType::Object(format!("{:?}", o)));
+                }
+            }
+            DataType::Resource => todo!(),
+            DataType::Reference => todo!(),
+            DataType::Callable => {
+                if let Some(c) = arg.callable() {
+                    args.push(ArgumentType::Callable(format!("{:?}", c)));
+                }
+            }
+            DataType::ConstantExpression => todo!(),
+            DataType::Void => {
+                args.push(ArgumentType::Void);
+            }
+            DataType::Mixed => {
+                args.push(ArgumentType::Mixed(format!("{:?}", arg)));
+            }
+            DataType::Ptr => todo!(),
+            DataType::Indirect => todo!(),
         }
     }
 
