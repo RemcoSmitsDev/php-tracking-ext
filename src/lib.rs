@@ -1,23 +1,40 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use ext_php_rs::ffi::ZEND_INTERNAL_FUNCTION;
 use ext_php_rs::flags::DataType;
 use ext_php_rs::types::Zval;
 use ext_php_rs::{prelude::*, zend::ExecuteData};
+use futures_util::{SinkExt as _, StreamExt as _};
 use lazy_static::lazy_static;
+use parking_lot::Mutex;
 use serde::Serialize;
+use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::ffi::CStr;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Mutex,
-};
+use std::ffi::{c_char, CStr};
+use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+
+mod util;
+
+#[derive(Debug, Clone, Serialize)]
+struct ProfileData {
+    start_timestamp: DateTime<Utc>,
+    end_timestamp: DateTime<Utc>,
+    callstack: Vec<CallType>,
+    duration: TimeDelta,
+    url: String,
+}
+
+thread_local! {
+    static ACTIVE_CALLS: RefCell<VecDeque<(StackId, Instant)>> = RefCell::new(VecDeque::with_capacity(1024));
+    static THREAD_FUNCTION_CALLS: RefCell<Vec<CallType>> = RefCell::new(Vec::with_capacity(1000));
+}
 
 lazy_static! {
-    static ref FUNCTION_CALLS: Mutex<Vec<CallType>> = Mutex::new(Vec::new());
+    static ref FUNCTION_CALLS: Mutex<Vec<CallType>> = Mutex::new(Vec::with_capacity(27000));
     static ref REQUEST_START_TIME: Mutex<Option<DateTime<Utc>>> = Mutex::new(None);
-    static ref ACTIVE_CALLS: Mutex<VecDeque<(StackId, DateTime<Utc>, Instant)>> =
-        Mutex::new(VecDeque::new());
     static ref STACK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 }
 
@@ -25,20 +42,24 @@ type StackId = u64;
 
 #[derive(Debug, Clone, Serialize)]
 struct FunctionCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
     line: Option<u32>,
     name: String,
     stack_id: u64,
     internal: bool,
     duration: Duration,
     parent_stack_id: u64,
-    timestamp: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     filename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     namespace: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     arguments: Vec<ArgumentType>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct MethodCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
     line: Option<u32>,
     name: String,
     internal: bool,
@@ -46,9 +67,11 @@ struct MethodCall {
     classname: String,
     duration: Duration,
     parent_stack_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     filename: Option<String>,
-    timestamp: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     namespace: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     arguments: Vec<ArgumentType>,
 }
 
@@ -76,98 +99,124 @@ enum ArgumentType {
     Void,
 }
 
+fn flush_thread_function_calls() {
+    THREAD_FUNCTION_CALLS.with(|calls| {
+        let mut calls = calls.borrow_mut();
+        if !calls.is_empty() {
+            let mut global_calls = FUNCTION_CALLS.lock();
+            global_calls.extend(calls.drain(..));
+        }
+    });
+}
+
+async fn maintain_websocket_connection(rx: crossbeam_channel::Receiver<ProfileData>) {
+    const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+    let url = "ws://localhost:3000/ws";
+
+    loop {
+        match connect_async(url).await {
+            Ok((ws_stream, _)) => {
+                let (mut write, _read) = ws_stream.split();
+
+                dbg!("[CONNECTED] to WS");
+
+                loop {
+                    match rx.recv() {
+                        Ok(profile_data) => {
+                            let data = serde_json::to_string(&profile_data).unwrap();
+                            if let Err(error) = write.send(Message::Text(data.into())).await {
+                                eprintln!("Failed to send profile data: {:?}", error);
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to connect to WebSocket: {:?}", e);
+                println!("Retrying connection in {:?}", RECONNECT_DELAY);
+                tokio::time::sleep(RECONNECT_DELAY).await;
+            }
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn startup(_type: i32, _module: i32) -> i32 {
+    register_observer();
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn shutdown(_type: i32, _module: i32) -> i32 {
+    0
+}
+
 #[no_mangle]
 pub extern "C" fn request_startup(_type: i32, _module: i32) -> i32 {
-    *REQUEST_START_TIME.lock().unwrap() = Some(chrono::Utc::now());
+    *REQUEST_START_TIME.lock() = Some(chrono::Utc::now());
 
     0
 }
 
 #[no_mangle]
 pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
-    use reqwest::blocking;
-
-    let start_timestamp = REQUEST_START_TIME.lock().unwrap().clone().unwrap();
     let end_timestamp = chrono::Utc::now();
 
-    let duration = end_timestamp.signed_duration_since(start_timestamp);
-    let total_micros = duration.num_microseconds().unwrap();
-    let seconds = total_micros / 1_000_000;
-    let millis = (total_micros % 1_000_000) / 1_000;
-    let micros = total_micros % 1_000;
-    println!(
-        "\nRequest completed in: {}s {}ms {}µs\nTotal function/method calls {:?}",
-        seconds,
-        millis,
-        micros,
-        STACK_ID_COUNTER.load(Ordering::SeqCst)
-    );
+    let start_timestamp = { REQUEST_START_TIME.lock().take() };
 
-    // Print call tree
-    let calls = FUNCTION_CALLS.lock().unwrap();
+    let Some(start_timestamp) = start_timestamp else {
+        return 0;
+    };
 
-    // Calculate total time in functions
-    let duration: Duration = calls
-        .iter()
-        .map(|call| match call {
-            CallType::Function(call) => call.duration,
-            CallType::Method(call) => call.duration,
-        })
-        .sum();
+    flush_thread_function_calls();
 
-    let client = blocking::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap();
+    let calls = {
+        let mut calls_guard = FUNCTION_CALLS.lock();
+        std::mem::take(&mut *calls_guard)
+    };
 
-    #[derive(Serialize)]
-    struct CreateRequest {
-        start_timestamp: DateTime<Utc>,
-        end_timestamp: DateTime<Utc>,
-        callstack: Vec<CallType>,
-        duration: Duration,
-        url: Option<String>,
-    }
+    dbg!(calls.len());
 
-    let response = client
-        .post("http://localhost:3000/requests")
-        .json(&CreateRequest {
-            start_timestamp,
-            end_timestamp,
-            duration,
-            callstack: calls.clone(),
-            url: Some("https://my-application.nl/api/v1/users".to_owned()),
-        })
-        .send()
-        .unwrap();
+    // #[cfg(debug_assertions)]
+    // print_call_tree(&calls, 0, 0);
 
-    dbg!(response.status(), response.text());
+    // std::thread::spawn(move || {
+    // std::panic::catch_unwind(|| {
+    //     let socket = std::net::TcpStream::connect("localhost:3000");
+    //     let Ok(mut stream) = socket else {
+    //         println!("Failed to connect to PHP tracking extension");
+    //         return;
+    //     };
 
-    // if let Ok(mut file) = std::fs::OpenOptions::new()
-    //     .write(true)
-    //     .create(true)
-    //     .truncate(true)
-    //     .open("call_tree.json")
-    // {
-    //     serde_json::to_writer_pretty(&mut file, &calls.clone()).unwrap();
-    // }
+    //     let profile_data = ProfileData {
+    //         start_timestamp,
+    //         end_timestamp,
+    //         callstack: calls,
+    //         duration: end_timestamp.signed_duration_since(start_timestamp),
+    //         url: "https://my-application.nl/api/v1/users".into(),
+    //     };
 
-    if cfg!(debug_assertions) {
-        println!("\nFunction call tree:");
-        print_call_tree(&calls, 0, 0);
-    }
+    //     match serde_json::to_string(&profile_data) {
+    //         Ok(data) => {
+    //             let request = format!(
+    //                 "POST /ws HTTP/1.1\r\n\
+    //                     Host: localhost:3000\r\n\
+    //                     Content-Type: application/json\r\n\
+    //                     Content-Length: {}\r\n\r\n\
+    //                     {}",
+    //                 data.len(),
+    //                 data
+    //             );
 
-    drop(calls);
-
-    println!("\nTotal time in functions: {:?} ", duration);
-
-    if let Ok(mut calls) = FUNCTION_CALLS.lock() {
-        calls.clear();
-    }
-    if let Ok(mut call_stack) = ACTIVE_CALLS.lock() {
-        call_stack.clear();
-    }
-    STACK_ID_COUNTER.store(0, Ordering::SeqCst);
+    //             let _ = stream.write_all(request.as_bytes());
+    //         }
+    //         Err(e) => eprintln!("Failed to serialize profile data: {:?}", e),
+    //     }
+    // }).unwrap_or_else(|_| {
+    //     eprintln!("PHP tracking extension thread panicked, stopping profiler");
+    // });
+    // });
 
     0
 }
@@ -197,24 +246,38 @@ extern "C" {
 
 #[no_mangle]
 extern "C" fn observer_begin(_: *mut ExecuteData) {
-    if let Ok(mut active_calls) = ACTIVE_CALLS.lock() {
-        active_calls.push_back((
-            STACK_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
-            chrono::Utc::now(),
+    ACTIVE_CALLS.with(|calls| {
+        let mut calls = calls.borrow_mut();
+        calls.push_back((
+            STACK_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             Instant::now(),
         ));
-    }
+    });
 }
 
 #[no_mangle]
 extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::ffi::zend_value) {
-    let Ok(Some((stack_id, start_time, instant))) =
-        ACTIVE_CALLS.lock().map(|mut calls| calls.pop_back())
-    else {
+    let Some((stack_id, instant, parent_stack_id)) = ACTIVE_CALLS.with(|calls| {
+        let mut calls = calls.borrow_mut();
+        let current = calls.back().cloned();
+        if let Some((id, inst)) = current {
+            calls.pop_back();
+            let parent_id = calls.back().map(|stack| stack.0).unwrap_or(0);
+            Some((id, inst, parent_id))
+        } else {
+            return None;
+        }
+    }) else {
         return;
     };
 
     let elapsed = instant.elapsed();
+
+    // reduce amount of calls reported
+    // normally around 27.000 calls for a normal symfony application
+    // if elapsed < Duration::from_millis(1) {
+    //     // return;
+    // }
 
     let Some(execute_data_ref) = (unsafe { execute_data.as_ref() }) else {
         return;
@@ -228,44 +291,50 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
         return;
     };
 
-    let (filename, line) = {
-        let op_array = unsafe { func.op_array };
-        if !op_array.filename.is_null() {
-            (
-                Some(unsafe {
-                    CStr::from_ptr((*op_array.filename).val.as_ptr())
-                        .to_string_lossy()
-                        .into_owned()
-                }),
-                Some(op_array.line_start),
-            )
+    let internal = unsafe { func.type_ } as u32 == ZEND_INTERNAL_FUNCTION;
+
+    let function_name = unsafe {
+        // Cache commonly used function names
+        static mut NAME_CACHE: Option<fnv::FnvHashMap<*const c_char, String>> = None;
+        let cache = NAME_CACHE.get_or_insert_with(|| fnv::FnvHashMap::default());
+
+        let ptr = name_ptr.val.as_ptr();
+        if let Some(cached) = cache.get(&ptr) {
+            cached.clone()
         } else {
-            (None, None)
+            let name = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+            cache.insert(ptr, name.clone());
+            name
         }
     };
 
-    let function_name = unsafe {
-        CStr::from_ptr(name_ptr.val.as_ptr())
-            .to_string_lossy()
-            .into_owned()
+    let (filename, line) = {
+        if internal {
+            // Internal functions don't have filename/line info
+            (None, None)
+        } else {
+            let op_array = unsafe { func.op_array };
+            let filename_str = (|| {
+                let filename_ptr = unsafe { op_array.filename.as_ref() }?;
+                let str_ptr = filename_ptr.val.as_ptr();
+                if str_ptr.is_null() {
+                    return None;
+                }
+                Some(unsafe { CStr::from_ptr(str_ptr).to_string_lossy().into_owned() })
+            })();
+
+            (filename_str, Some(op_array.line_start))
+        }
     };
 
-    let arguments = unsafe { get_function_arguments(execute_data) };
+    // let arguments = unsafe { get_function_arguments(execute_data) };
+    let arguments = Vec::default();
 
     let scope = unsafe { func.internal_function.scope.as_ref() }
         .and_then(|scope| scope.name())
         .map(|scope| scope.to_owned());
 
-    // Get parent stack ID
-    let parent_stack_id = if let Ok(mut active_calls) = ACTIVE_CALLS.lock() {
-        let id = active_calls.back().map(|stack| stack.0).unwrap_or(0);
-        active_calls.pop_back();
-        id
-    } else {
-        0
-    };
-
-    if let Some(scope) = scope {
+    let call = if let Some(scope) = scope {
         let parts: Vec<&str> = scope.rsplitn(2, '\\').collect();
         let (classname, namespace) = match parts.as_slice() {
             [classname, namespace] => (classname.to_string(), Some(namespace.to_string())),
@@ -273,39 +342,42 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
             _ => return,
         };
 
-        {
-            let mut calls = FUNCTION_CALLS.lock().unwrap();
-            calls.push(CallType::Method(MethodCall {
-                line,
-                stack_id,
-                classname,
-                namespace,
-                arguments,
-                filename,
-                parent_stack_id,
-                duration: elapsed,
-                name: function_name,
-                timestamp: start_time,
-                internal: unsafe { func.type_ } as u32 == ZEND_INTERNAL_FUNCTION,
-            }));
-        }
+        CallType::Method(MethodCall {
+            line,
+            stack_id,
+            classname,
+            namespace,
+            arguments,
+            internal,
+            filename,
+            parent_stack_id,
+            duration: elapsed,
+            name: function_name,
+        })
     } else {
-        {
-            let mut calls = FUNCTION_CALLS.lock().unwrap();
-            calls.push(CallType::Function(FunctionCall {
-                line,
-                stack_id,
-                arguments,
-                filename,
-                namespace: None,
-                parent_stack_id,
-                duration: elapsed,
-                name: function_name,
-                timestamp: start_time,
-                internal: unsafe { func.type_ } as u32 == ZEND_INTERNAL_FUNCTION,
-            }));
+        CallType::Function(FunctionCall {
+            line,
+            stack_id,
+            arguments,
+            filename,
+            internal,
+            namespace: None,
+            parent_stack_id,
+            duration: elapsed,
+            name: function_name,
+        })
+    };
+
+    THREAD_FUNCTION_CALLS.with(|calls| {
+        let mut calls = calls.borrow_mut();
+        calls.push(call);
+
+        // Periodically flush to the global FUNCTION_CALLS
+        if calls.len() >= 500 {
+            let mut global_calls = FUNCTION_CALLS.lock();
+            global_calls.extend(calls.drain(..));
         }
-    }
+    });
 }
 
 #[no_mangle]
@@ -326,9 +398,9 @@ pub extern "C" fn register_observer() {
 /// Initialize the module and setup function tracking
 #[php_module]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
-    register_observer();
-
     module
+        .startup_function(startup)
+        .shutdown_function(shutdown)
         .request_startup_function(request_startup)
         .request_shutdown_function(request_shutdown)
 }
