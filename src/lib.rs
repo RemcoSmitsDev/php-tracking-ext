@@ -1,20 +1,20 @@
 use chrono::{DateTime, TimeDelta, Utc};
-use ext_php_rs::ffi::ZEND_INTERNAL_FUNCTION;
-use ext_php_rs::flags::DataType;
-use ext_php_rs::types::Zval;
-use ext_php_rs::{prelude::*, zend::ExecuteData};
+use ext_php_rs::{
+    ffi::ZEND_INTERNAL_FUNCTION, flags::DataType, prelude::*, types::Zval, zend::ExecuteData,
+};
 use futures_util::{SinkExt as _, StreamExt as _};
 use lazy_static::lazy_static;
 use parking_lot::Mutex;
 use serde::Serialize;
-use std::cell::RefCell;
-use std::collections::VecDeque;
-use std::ffi::{c_char, CStr};
-use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
+use std::{
+    cell::RefCell,
+    collections::VecDeque,
+    ffi::CStr,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
+};
+use tokio::runtime::Runtime;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 mod util;
 
@@ -36,6 +36,7 @@ lazy_static! {
     static ref FUNCTION_CALLS: Mutex<Vec<CallType>> = Mutex::new(Vec::with_capacity(27000));
     static ref REQUEST_START_TIME: Mutex<Option<DateTime<Utc>>> = Mutex::new(None);
     static ref STACK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static ref PROFILE_TX: Mutex<Option<crossbeam_channel::Sender<ProfileData>>> = Mutex::new(None);
 }
 
 type StackId = u64;
@@ -110,33 +111,23 @@ fn flush_thread_function_calls() {
 }
 
 async fn maintain_websocket_connection(rx: crossbeam_channel::Receiver<ProfileData>) {
-    const RECONNECT_DELAY: Duration = Duration::from_secs(5);
-    let url = "ws://localhost:3000/ws";
+    const WS_URL: &str = "ws://localhost:3000/ws";
 
-    loop {
-        match connect_async(url).await {
-            Ok((ws_stream, _)) => {
-                let (mut write, _read) = ws_stream.split();
+    match connect_async(WS_URL).await {
+        Ok((ws_stream, _)) => {
+            let (mut write, _read) = ws_stream.split();
 
-                dbg!("[CONNECTED] to WS");
+            dbg!("[CONNECTED] to WS");
 
-                loop {
-                    match rx.recv() {
-                        Ok(profile_data) => {
-                            let data = serde_json::to_string(&profile_data).unwrap();
-                            if let Err(error) = write.send(Message::Text(data.into())).await {
-                                eprintln!("Failed to send profile data: {:?}", error);
-                            }
-                        }
-                        Err(_) => return,
-                    }
+            while let Ok(profile_data) = rx.recv() {
+                let data = serde_json::to_string(&profile_data).unwrap();
+                if let Err(error) = write.send(Message::Text(data.into())).await {
+                    eprintln!("Failed to send profile data: {:?}", error);
                 }
             }
-            Err(e) => {
-                eprintln!("Failed to connect to WebSocket: {:?}", e);
-                println!("Retrying connection in {:?}", RECONNECT_DELAY);
-                tokio::time::sleep(RECONNECT_DELAY).await;
-            }
+        }
+        Err(error) => {
+            eprintln!("Failed to connect to WebSocket: {:?}", error);
         }
     }
 }
@@ -144,11 +135,23 @@ async fn maintain_websocket_connection(rx: crossbeam_channel::Receiver<ProfileDa
 #[no_mangle]
 pub extern "C" fn startup(_type: i32, _module: i32) -> i32 {
     register_observer();
+
+    let (tx, rx) = crossbeam_channel::unbounded();
+
+    *PROFILE_TX.lock() = Some(tx);
+
+    std::thread::spawn(move || {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async move { maintain_websocket_connection(rx).await });
+    });
+
     0
 }
 
 #[no_mangle]
 pub extern "C" fn shutdown(_type: i32, _module: i32) -> i32 {
+    let _ = PROFILE_TX.lock().take();
+
     0
 }
 
@@ -178,45 +181,20 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
 
     dbg!(calls.len());
 
-    // #[cfg(debug_assertions)]
-    // print_call_tree(&calls, 0, 0);
-
-    // std::thread::spawn(move || {
-    // std::panic::catch_unwind(|| {
-    //     let socket = std::net::TcpStream::connect("localhost:3000");
-    //     let Ok(mut stream) = socket else {
-    //         println!("Failed to connect to PHP tracking extension");
-    //         return;
-    //     };
-
-    //     let profile_data = ProfileData {
-    //         start_timestamp,
-    //         end_timestamp,
-    //         callstack: calls,
-    //         duration: end_timestamp.signed_duration_since(start_timestamp),
-    //         url: "https://my-application.nl/api/v1/users".into(),
-    //     };
-
-    //     match serde_json::to_string(&profile_data) {
-    //         Ok(data) => {
-    //             let request = format!(
-    //                 "POST /ws HTTP/1.1\r\n\
-    //                     Host: localhost:3000\r\n\
-    //                     Content-Type: application/json\r\n\
-    //                     Content-Length: {}\r\n\r\n\
-    //                     {}",
-    //                 data.len(),
-    //                 data
-    //             );
-
-    //             let _ = stream.write_all(request.as_bytes());
-    //         }
-    //         Err(e) => eprintln!("Failed to serialize profile data: {:?}", e),
-    //     }
-    // }).unwrap_or_else(|_| {
-    //     eprintln!("PHP tracking extension thread panicked, stopping profiler");
-    // });
-    // });
+    if let Some(tx) = PROFILE_TX.lock().as_ref() {
+        tx.send(ProfileData {
+            start_timestamp,
+            end_timestamp,
+            callstack: calls,
+            duration: end_timestamp.signed_duration_since(start_timestamp),
+            url: "https://my-application.nl/api/v1/users".into(),
+        })
+        .unwrap_or_else(|_| {
+            eprintln!("PHP tracking extension thread panicked, stopping profiler");
+        });
+    } else {
+        dbg!("[PROFILE TX] dropped");
+    }
 
     0
 }
@@ -265,7 +243,7 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
             let parent_id = calls.back().map(|stack| stack.0).unwrap_or(0);
             Some((id, inst, parent_id))
         } else {
-            return None;
+            None
         }
     }) else {
         return;
@@ -294,23 +272,13 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
     let internal = unsafe { func.type_ } as u32 == ZEND_INTERNAL_FUNCTION;
 
     let function_name = unsafe {
-        // Cache commonly used function names
-        static mut NAME_CACHE: Option<fnv::FnvHashMap<*const c_char, String>> = None;
-        let cache = NAME_CACHE.get_or_insert_with(|| fnv::FnvHashMap::default());
-
-        let ptr = name_ptr.val.as_ptr();
-        if let Some(cached) = cache.get(&ptr) {
-            cached.clone()
-        } else {
-            let name = CStr::from_ptr(ptr).to_string_lossy().into_owned();
-            cache.insert(ptr, name.clone());
-            name
-        }
+        CStr::from_ptr(name_ptr.val.as_ptr())
+            .to_string_lossy()
+            .into_owned()
     };
 
     let (filename, line) = {
         if internal {
-            // Internal functions don't have filename/line info
             (None, None)
         } else {
             let op_array = unsafe { func.op_array };
