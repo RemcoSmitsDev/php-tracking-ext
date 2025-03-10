@@ -29,11 +29,10 @@ struct ProfileData {
 
 thread_local! {
     static ACTIVE_CALLS: RefCell<VecDeque<(StackId, Instant)>> = RefCell::new(VecDeque::with_capacity(1024));
-    static THREAD_FUNCTION_CALLS: RefCell<Vec<CallType>> = RefCell::new(Vec::with_capacity(1000));
+    static FUNCTION_CALLS: RefCell<Vec<CallType>> = RefCell::new(Vec::with_capacity(27000));
 }
 
 lazy_static! {
-    static ref FUNCTION_CALLS: Mutex<Vec<CallType>> = Mutex::new(Vec::with_capacity(27000));
     static ref REQUEST_START_TIME: Mutex<Option<DateTime<Utc>>> = Mutex::new(None);
     static ref STACK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
     static ref PROFILE_TX: Mutex<Option<crossbeam_channel::Sender<ProfileData>>> = Mutex::new(None);
@@ -100,16 +99,6 @@ enum ArgumentType {
     Void,
 }
 
-fn flush_thread_function_calls() {
-    THREAD_FUNCTION_CALLS.with(|calls| {
-        let mut calls = calls.borrow_mut();
-        if !calls.is_empty() {
-            let mut global_calls = FUNCTION_CALLS.lock();
-            global_calls.extend(calls.drain(..));
-        }
-    });
-}
-
 async fn maintain_websocket_connection(rx: crossbeam_channel::Receiver<ProfileData>) {
     const WS_URL: &str = "ws://localhost:3000/ws";
 
@@ -120,14 +109,19 @@ async fn maintain_websocket_connection(rx: crossbeam_channel::Receiver<ProfileDa
             dbg!("[CONNECTED] to WS");
 
             while let Ok(profile_data) = rx.recv() {
+                dbg!("received", &profile_data);
                 let data = serde_json::to_string(&profile_data).unwrap();
                 if let Err(error) = write.send(Message::Text(data.into())).await {
-                    eprintln!("Failed to send profile data: {:?}", error);
+                    dbg!("Failed to send profile data: {:?}", error);
+                } else {
+                    dbg!("did send message throug socket");
                 }
             }
+
+            dbg!("end off channel receive");
         }
         Err(error) => {
-            eprintln!("Failed to connect to WebSocket: {:?}", error);
+            dbg!("Failed to connect to WebSocket: {:?}", error);
         }
     }
 }
@@ -136,13 +130,21 @@ async fn maintain_websocket_connection(rx: crossbeam_channel::Receiver<ProfileDa
 pub extern "C" fn startup(_type: i32, _module: i32) -> i32 {
     register_observer();
 
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let (tx, rx) = crossbeam_channel::unbounded::<ProfileData>();
 
-    *PROFILE_TX.lock() = Some(tx);
+    {
+        *PROFILE_TX.lock() = Some(tx);
+    }
 
     std::thread::spawn(move || {
         let rt = Runtime::new().unwrap();
-        rt.block_on(async move { maintain_websocket_connection(rx).await });
+        rt.block_on(async move {
+            dbg!("Starting WebSocket handler");
+            maintain_websocket_connection(rx).await;
+            dbg!("WebSocket handler completed");
+        });
+
+        dbg!("SOCKET IS DOWN");
     });
 
     0
@@ -164,34 +166,36 @@ pub extern "C" fn request_startup(_type: i32, _module: i32) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
-    let end_timestamp = chrono::Utc::now();
-
     let start_timestamp = { REQUEST_START_TIME.lock().take() };
 
     let Some(start_timestamp) = start_timestamp else {
         return 0;
     };
 
-    flush_thread_function_calls();
+    let callstack = FUNCTION_CALLS.with(|calls| std::mem::take(&mut *calls.borrow_mut()));
 
-    let calls = {
-        let mut calls_guard = FUNCTION_CALLS.lock();
-        std::mem::take(&mut *calls_guard)
-    };
-
-    dbg!(calls.len());
+    let end_timestamp = chrono::Utc::now();
+    dbg!(callstack.len());
 
     if let Some(tx) = PROFILE_TX.lock().as_ref() {
-        tx.send(ProfileData {
+        let result = tx.send(ProfileData {
             start_timestamp,
             end_timestamp,
-            callstack: calls,
+            callstack,
             duration: end_timestamp.signed_duration_since(start_timestamp),
             url: "https://my-application.nl/api/v1/users".into(),
-        })
-        .unwrap_or_else(|_| {
-            eprintln!("PHP tracking extension thread panicked, stopping profiler");
         });
+
+        match result {
+            Ok(_) => {
+                dbg!("[REQUEST SHUTDOWN] PHP tracking send profile data");
+            }
+            Err(_) => {
+                dbg!(
+                    "[REQUEST SHUTDOWN] PHP tracking extension thread panicked, stopping profiler"
+                );
+            }
+        }
     } else {
         dbg!("[PROFILE TX] dropped");
     }
@@ -253,9 +257,9 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
 
     // reduce amount of calls reported
     // normally around 27.000 calls for a normal symfony application
-    // if elapsed < Duration::from_millis(1) {
-    //     // return;
-    // }
+    if elapsed < Duration::from_millis(1) {
+        return;
+    }
 
     let Some(execute_data_ref) = (unsafe { execute_data.as_ref() }) else {
         return;
@@ -336,16 +340,7 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
         })
     };
 
-    THREAD_FUNCTION_CALLS.with(|calls| {
-        let mut calls = calls.borrow_mut();
-        calls.push(call);
-
-        // Periodically flush to the global FUNCTION_CALLS
-        if calls.len() >= 500 {
-            let mut global_calls = FUNCTION_CALLS.lock();
-            global_calls.extend(calls.drain(..));
-        }
-    });
+    FUNCTION_CALLS.with(|calls| calls.borrow_mut().push(call));
 }
 
 #[no_mangle]
@@ -454,7 +449,6 @@ unsafe fn get_function_arguments(execute_data: *mut ExecuteData) -> Vec<Argument
     args
 }
 
-#[cfg(debug_assertions)]
 fn print_call_tree(calls: &[CallType], parent_id: u64, level: usize) {
     for call in calls.iter().filter(|c| match c {
         CallType::Function(c) => c.parent_stack_id == parent_id,
