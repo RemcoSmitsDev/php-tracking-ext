@@ -2,9 +2,6 @@ use chrono::{DateTime, TimeDelta, Utc};
 use ext_php_rs::{
     ffi::ZEND_INTERNAL_FUNCTION, flags::DataType, prelude::*, types::Zval, zend::ExecuteData,
 };
-use futures_util::{SinkExt as _, StreamExt as _};
-use lazy_static::lazy_static;
-use parking_lot::Mutex;
 use serde::Serialize;
 use std::{
     cell::RefCell,
@@ -13,8 +10,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
-use tokio::runtime::Runtime;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::{io::AsyncWriteExt as _, net::UnixStream};
 
 mod util;
 
@@ -30,13 +26,10 @@ struct ProfileData {
 thread_local! {
     static ACTIVE_CALLS: RefCell<VecDeque<(StackId, Instant)>> = RefCell::new(VecDeque::with_capacity(1024));
     static FUNCTION_CALLS: RefCell<Vec<CallType>> = RefCell::new(Vec::with_capacity(27000));
+    static REQUEST_START_TIME: RefCell<Option<DateTime<Utc>>> = RefCell::new(None);
 }
 
-lazy_static! {
-    static ref REQUEST_START_TIME: Mutex<Option<DateTime<Utc>>> = Mutex::new(None);
-    static ref STACK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-    static ref PROFILE_TX: Mutex<Option<crossbeam_channel::Sender<ProfileData>>> = Mutex::new(None);
-}
+static STACK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type StackId = u64;
 
@@ -99,106 +92,54 @@ enum ArgumentType {
     Void,
 }
 
-async fn maintain_websocket_connection(rx: crossbeam_channel::Receiver<ProfileData>) {
-    const WS_URL: &str = "ws://localhost:3000/ws";
-
-    match connect_async(WS_URL).await {
-        Ok((ws_stream, _)) => {
-            let (mut write, _read) = ws_stream.split();
-
-            dbg!("[CONNECTED] to WS");
-
-            while let Ok(profile_data) = rx.recv() {
-                dbg!("received", &profile_data);
-                let data = serde_json::to_string(&profile_data).unwrap();
-                if let Err(error) = write.send(Message::Text(data.into())).await {
-                    dbg!("Failed to send profile data: {:?}", error);
-                } else {
-                    dbg!("did send message throug socket");
-                }
-            }
-
-            dbg!("end off channel receive");
-        }
-        Err(error) => {
-            dbg!("Failed to connect to WebSocket: {:?}", error);
-        }
-    }
-}
-
 #[no_mangle]
 pub extern "C" fn startup(_type: i32, _module: i32) -> i32 {
     register_observer();
-
-    let (tx, rx) = crossbeam_channel::unbounded::<ProfileData>();
-
-    {
-        *PROFILE_TX.lock() = Some(tx);
-    }
-
-    std::thread::spawn(move || {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async move {
-            dbg!("Starting WebSocket handler");
-            maintain_websocket_connection(rx).await;
-            dbg!("WebSocket handler completed");
-        });
-
-        dbg!("SOCKET IS DOWN");
-    });
 
     0
 }
 
 #[no_mangle]
 pub extern "C" fn shutdown(_type: i32, _module: i32) -> i32 {
-    let _ = PROFILE_TX.lock().take();
-
     0
 }
 
 #[no_mangle]
 pub extern "C" fn request_startup(_type: i32, _module: i32) -> i32 {
-    *REQUEST_START_TIME.lock() = Some(chrono::Utc::now());
+    REQUEST_START_TIME.with_borrow_mut(|time| {
+        *time = Some(chrono::Utc::now());
+    });
 
     0
 }
 
 #[no_mangle]
 pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
-    let start_timestamp = { REQUEST_START_TIME.lock().take() };
-
-    let Some(start_timestamp) = start_timestamp else {
+    let Some(start_timestamp) = REQUEST_START_TIME.take() else {
         return 0;
     };
 
     let callstack = FUNCTION_CALLS.with(|calls| std::mem::take(&mut *calls.borrow_mut()));
 
     let end_timestamp = chrono::Utc::now();
-    dbg!(callstack.len());
+    let profile_data = ProfileData {
+        start_timestamp,
+        end_timestamp,
+        callstack,
+        duration: end_timestamp.signed_duration_since(start_timestamp),
+        url: "https://my-application.nl/api/v1/users".into(),
+    };
 
-    if let Some(tx) = PROFILE_TX.lock().as_ref() {
-        let result = tx.send(ProfileData {
-            start_timestamp,
-            end_timestamp,
-            callstack,
-            duration: end_timestamp.signed_duration_since(start_timestamp),
-            url: "https://my-application.nl/api/v1/users".into(),
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            if let Ok(json) = serde_json::to_string(&profile_data) {
+                if let Ok(mut stream) = UnixStream::connect("/tmp/php-tracking-daemon.sock").await {
+                    let _ = stream.write_all(json.as_bytes()).await;
+                }
+            }
         });
-
-        match result {
-            Ok(_) => {
-                dbg!("[REQUEST SHUTDOWN] PHP tracking send profile data");
-            }
-            Err(_) => {
-                dbg!(
-                    "[REQUEST SHUTDOWN] PHP tracking extension thread panicked, stopping profiler"
-                );
-            }
-        }
-    } else {
-        dbg!("[PROFILE TX] dropped");
-    }
+    });
 
     0
 }
@@ -299,8 +240,7 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
         }
     };
 
-    // let arguments = unsafe { get_function_arguments(execute_data) };
-    let arguments = Vec::default();
+    let arguments = unsafe { get_function_arguments(execute_data) };
 
     let scope = unsafe { func.internal_function.scope.as_ref() }
         .and_then(|scope| scope.name())
@@ -427,28 +367,29 @@ unsafe fn get_function_arguments(execute_data: *mut ExecuteData) -> Vec<Argument
                     args.push(ArgumentType::Object(format!("{:?}", o)));
                 }
             }
-            DataType::Resource => todo!(),
-            DataType::Reference => todo!(),
+            DataType::Resource => {}
+            DataType::Reference => {}
             DataType::Callable => {
                 if let Some(c) = arg.callable() {
                     args.push(ArgumentType::Callable(format!("{:?}", c)));
                 }
             }
-            DataType::ConstantExpression => todo!(),
+            DataType::ConstantExpression => {}
             DataType::Void => {
                 args.push(ArgumentType::Void);
             }
             DataType::Mixed => {
                 args.push(ArgumentType::Mixed(format!("{:?}", arg)));
             }
-            DataType::Ptr => todo!(),
-            DataType::Indirect => todo!(),
+            DataType::Ptr => {}
+            DataType::Indirect => {}
         }
     }
 
     args
 }
 
+#[allow(dead_code)]
 fn print_call_tree(calls: &[CallType], parent_id: u64, level: usize) {
     for call in calls.iter().filter(|c| match c {
         CallType::Function(c) => c.parent_stack_id == parent_id,
