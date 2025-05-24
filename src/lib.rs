@@ -39,6 +39,7 @@ struct ActiveCall {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
 enum RequestValue {
     String(String),
     Bool(bool),
