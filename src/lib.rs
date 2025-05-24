@@ -1,11 +1,15 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use ext_php_rs::{
-    ffi::ZEND_INTERNAL_FUNCTION, flags::DataType, prelude::*, types::Zval, zend::ExecuteData,
+    ffi::{_zval_struct, ZEND_INTERNAL_FUNCTION},
+    flags::DataType,
+    prelude::*,
+    types::Zval,
+    zend::{ExecuteData, ProcessGlobals},
 };
 use serde::Serialize;
 use std::{
     cell::RefCell,
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     ffi::CStr,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
@@ -21,12 +25,41 @@ struct ProfileData {
     callstack: Vec<CallType>,
     duration: TimeDelta,
     url: String,
+    server: HashMap<String, RequestValue>,
+    request: HashMap<String, RequestValue>,
+    cookies: HashMap<String, RequestValue>,
+    get: HashMap<String, RequestValue>,
+    post: HashMap<String, RequestValue>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveCall {
+    stack_id: StackId,
+    start_time: Instant,
+}
+
+#[derive(Debug, Clone, Serialize)]
+enum RequestValue {
+    String(String),
+    Bool(bool),
+    Int(i64),
+    Array(HashMap<String, RequestValue>),
+}
+
+#[derive(Debug, Clone)]
+struct Request {
+    start_time: DateTime<Utc>,
+    server: HashMap<String, RequestValue>,
+    request: HashMap<String, RequestValue>,
+    cookies: HashMap<String, RequestValue>,
+    get: HashMap<String, RequestValue>,
+    post: HashMap<String, RequestValue>,
 }
 
 thread_local! {
-    static ACTIVE_CALLS: RefCell<VecDeque<(StackId, Instant)>> = RefCell::new(VecDeque::with_capacity(1024));
-    static FUNCTION_CALLS: RefCell<Vec<CallType>> = RefCell::new(Vec::with_capacity(27000));
-    static REQUEST_START_TIME: RefCell<Option<DateTime<Utc>>> = RefCell::new(None);
+    static ACTIVE_CALLS: RefCell<VecDeque<ActiveCall>> = RefCell::new(VecDeque::with_capacity(1024));
+    static FUNCTION_CALLS: RefCell<Vec<CallType>> = RefCell::new(Vec::new());
+    static REQUEST: RefCell<Option<Request>> = RefCell::new(None);
 }
 
 static STACK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -35,15 +68,12 @@ type StackId = u64;
 
 #[derive(Debug, Clone, Serialize)]
 struct FunctionCall {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    line: Option<u32>,
     name: String,
     stack_id: u64,
     internal: bool,
     duration: Duration,
     parent_stack_id: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    filename: Option<String>,
+    filename: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     namespace: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -52,16 +82,13 @@ struct FunctionCall {
 
 #[derive(Debug, Clone, Serialize)]
 struct MethodCall {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    line: Option<u32>,
     name: String,
     internal: bool,
     stack_id: u64,
     classname: String,
     duration: Duration,
     parent_stack_id: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    filename: Option<String>,
+    filename: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     namespace: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -106,8 +133,72 @@ pub extern "C" fn shutdown(_type: i32, _module: i32) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn request_startup(_type: i32, _module: i32) -> i32 {
-    REQUEST_START_TIME.with_borrow_mut(|time| {
-        *time = Some(chrono::Utc::now());
+    fn map_value_to_request_value(value: &_zval_struct) -> Option<RequestValue> {
+        if let Some(value) = value.string() {
+            Some(RequestValue::String(value))
+        } else if let Some(value) = value.bool() {
+            Some(RequestValue::Bool(value))
+        } else if let Some(value) = value.long() {
+            Some(RequestValue::Int(value))
+        } else if let Some(value) = value.array() {
+            Some(RequestValue::Array(
+                value
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        Some((key.to_string(), map_value_to_request_value(value)?))
+                    })
+                    .collect(),
+            ))
+        } else {
+            return None;
+        }
+    }
+
+    REQUEST.with_borrow_mut(|request| {
+        *request = Some(Request {
+            start_time: chrono::Utc::now(),
+            server: ProcessGlobals::get()
+                .http_server_vars()
+                .map(|vars| {
+                    vars.iter()
+                        .filter_map(|(key, value)| {
+                            Some((key.to_string(), map_value_to_request_value(value)?))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            request: ProcessGlobals::get()
+                .http_request_vars()
+                .map(|vars| {
+                    vars.iter()
+                        .filter_map(|(key, value)| {
+                            Some((key.to_string(), map_value_to_request_value(value)?))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            cookies: ProcessGlobals::get()
+                .http_cookie_vars()
+                .iter()
+                .filter_map(|(key, value)| {
+                    Some((key.to_string(), map_value_to_request_value(value)?))
+                })
+                .collect(),
+            get: ProcessGlobals::get()
+                .http_get_vars()
+                .iter()
+                .filter_map(|(key, value)| {
+                    Some((key.to_string(), map_value_to_request_value(value)?))
+                })
+                .collect(),
+            post: ProcessGlobals::get()
+                .http_post_vars()
+                .iter()
+                .filter_map(|(key, value)| {
+                    Some((key.to_string(), map_value_to_request_value(value)?))
+                })
+                .collect(),
+        });
     });
 
     0
@@ -115,7 +206,7 @@ pub extern "C" fn request_startup(_type: i32, _module: i32) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
-    let Some(start_timestamp) = REQUEST_START_TIME.take() else {
+    let Some(request) = REQUEST.take() else {
         return 0;
     };
 
@@ -123,11 +214,16 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
 
     let end_timestamp = chrono::Utc::now();
     let profile_data = ProfileData {
-        start_timestamp,
+        start_timestamp: request.start_time,
         end_timestamp,
         callstack,
-        duration: end_timestamp.signed_duration_since(start_timestamp),
+        duration: end_timestamp.signed_duration_since(request.start_time),
         url: "https://my-application.nl/api/v1/users".into(),
+        cookies: request.cookies,
+        get: request.get,
+        post: request.post,
+        request: request.request,
+        server: request.server,
     };
 
     std::thread::spawn(move || {
@@ -171,22 +267,25 @@ extern "C" {
 extern "C" fn observer_begin(_: *mut ExecuteData) {
     ACTIVE_CALLS.with(|calls| {
         let mut calls = calls.borrow_mut();
-        calls.push_back((
-            STACK_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
-            Instant::now(),
-        ));
+        calls.push_back(ActiveCall {
+            stack_id: STACK_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            start_time: Instant::now(),
+        });
     });
 }
 
 #[no_mangle]
 extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::ffi::zend_value) {
-    let Some((stack_id, instant, parent_stack_id)) = ACTIVE_CALLS.with(|calls| {
+    let Some((active_call, parent_stack_id)) = ACTIVE_CALLS.with(|calls| {
         let mut calls = calls.borrow_mut();
         let current = calls.back().cloned();
-        if let Some((id, inst)) = current {
+        if let Some(active_call) = current {
             calls.pop_back();
-            let parent_id = calls.back().map(|stack| stack.0).unwrap_or(0);
-            Some((id, inst, parent_id))
+            let parent_id = calls
+                .back()
+                .map(|active_call| active_call.stack_id)
+                .unwrap_or(0);
+            Some((active_call, parent_id))
         } else {
             None
         }
@@ -194,7 +293,7 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
         return;
     };
 
-    let elapsed = instant.elapsed();
+    let elapsed = active_call.start_time.elapsed();
 
     // reduce amount of calls reported
     // normally around 27.000 calls for a normal symfony application
@@ -214,30 +313,29 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
         return;
     };
 
+    let Some(filename) = (unsafe {
+        execute_data_ref
+            .prev_execute_data
+            .as_ref()
+            .and_then(|caller| {
+                let op_array = caller.func.as_ref().map(|func| func.op_array)?;
+
+                op_array.filename.as_ref().map(|filename| {
+                    CStr::from_ptr(filename.val.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
+                })
+            })
+    }) else {
+        return;
+    };
+
     let internal = unsafe { func.type_ } as u32 == ZEND_INTERNAL_FUNCTION;
 
     let function_name = unsafe {
         CStr::from_ptr(name_ptr.val.as_ptr())
             .to_string_lossy()
             .into_owned()
-    };
-
-    let (filename, line) = {
-        if internal {
-            (None, None)
-        } else {
-            let op_array = unsafe { func.op_array };
-            let filename_str = (|| {
-                let filename_ptr = unsafe { op_array.filename.as_ref() }?;
-                let str_ptr = filename_ptr.val.as_ptr();
-                if str_ptr.is_null() {
-                    return None;
-                }
-                Some(unsafe { CStr::from_ptr(str_ptr).to_string_lossy().into_owned() })
-            })();
-
-            (filename_str, Some(op_array.line_start))
-        }
     };
 
     let arguments = unsafe { get_function_arguments(execute_data) };
@@ -255,8 +353,6 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
         };
 
         CallType::Method(MethodCall {
-            line,
-            stack_id,
             classname,
             namespace,
             arguments,
@@ -265,11 +361,10 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
             parent_stack_id,
             duration: elapsed,
             name: function_name,
+            stack_id: active_call.stack_id,
         })
     } else {
         CallType::Function(FunctionCall {
-            line,
-            stack_id,
             arguments,
             filename,
             internal,
@@ -277,6 +372,7 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
             parent_stack_id,
             duration: elapsed,
             name: function_name,
+            stack_id: active_call.stack_id,
         })
     };
 
@@ -398,27 +494,25 @@ fn print_call_tree(calls: &[CallType], parent_id: u64, level: usize) {
         match call {
             CallType::Function(call) => {
                 println!(
-                    "{:indent$}└─ {}::{} ({}ms) [{}:{}]",
+                    "{:indent$}└─ {}::{} ({}ms) [{}]",
                     "",
                     call.namespace.clone().unwrap_or_default(),
                     call.name,
                     call.duration.as_millis(),
-                    call.filename.clone().unwrap_or_default(),
-                    call.line.unwrap_or_default(),
+                    call.filename.clone(),
                     indent = level * 2
                 );
                 print_call_tree(calls, call.stack_id, level + 1);
             }
             CallType::Method(call) => {
                 println!(
-                    "{:indent$}└─ {}{}::{} ({}ms) [{}:{}]",
+                    "{:indent$}└─ {}{}::{} ({}ms) [{}]",
                     "",
                     call.namespace.clone().unwrap_or_default(),
                     call.classname.clone(),
                     call.name,
                     call.duration.as_millis(),
-                    call.filename.clone().unwrap_or_default(),
-                    call.line.unwrap_or_default(),
+                    call.filename.clone(),
                     indent = level * 2
                 );
                 print_call_tree(calls, call.stack_id, level + 1);
