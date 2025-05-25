@@ -24,7 +24,8 @@ struct ProfileData {
     end_timestamp: DateTime<Utc>,
     callstack: Vec<CallType>,
     duration: TimeDelta,
-    url: String,
+    url: Option<String>,
+    method: Option<String>,
     server: HashMap<String, RequestValue>,
     request: HashMap<String, RequestValue>,
     cookies: HashMap<String, RequestValue>,
@@ -50,6 +51,8 @@ enum RequestValue {
 #[derive(Debug, Clone)]
 struct Request {
     start_time: DateTime<Utc>,
+    method: Option<String>,
+    url: Option<String>,
     server: HashMap<String, RequestValue>,
     request: HashMap<String, RequestValue>,
     cookies: HashMap<String, RequestValue>,
@@ -158,6 +161,29 @@ pub extern "C" fn request_startup(_type: i32, _module: i32) -> i32 {
     REQUEST.with_borrow_mut(|request| {
         *request = Some(Request {
             start_time: chrono::Utc::now(),
+            method: ProcessGlobals::get()
+                .http_server_vars()
+                .and_then(|vars| vars.get("REQUEST_METHOD"))
+                .and_then(|method| (*method).string()),
+            url: ProcessGlobals::get()
+                .http_server_vars()
+                .and_then(|vars| {
+                    Some((
+                        vars.get("SERVER_PROTOCOL")?.string()?,
+                        vars.get("HTTP_HOST")?.string()?,
+                        vars.get("REQUEST_URI")?.string()?,
+                    ))
+                })
+                .map(|(protocol, host, uri)| {
+                    format!(
+                        "{}{host}{uri}",
+                        if protocol.starts_with("HTTPS") {
+                            "https://"
+                        } else {
+                            "http://"
+                        }
+                    )
+                }),
             server: ProcessGlobals::get()
                 .http_server_vars()
                 .map(|vars| {
@@ -219,7 +245,8 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
         end_timestamp,
         callstack,
         duration: end_timestamp.signed_duration_since(request.start_time),
-        url: "https://my-application.nl/api/v1/users".into(),
+        method: request.method,
+        url: request.url,
         cookies: request.cookies,
         get: request.get,
         post: request.post,
