@@ -4,7 +4,7 @@ use ext_php_rs::{
     flags::DataType,
     prelude::*,
     types::Zval,
-    zend::{ExecuteData, ProcessGlobals},
+    zend::{ExecuteData, ProcessGlobals, SapiGlobals},
 };
 use serde::Serialize;
 use std::{
@@ -20,12 +20,13 @@ mod util;
 
 #[derive(Debug, Clone, Serialize)]
 struct ProfileData {
-    start_timestamp: DateTime<Utc>,
-    end_timestamp: DateTime<Utc>,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
     callstack: Vec<CallType>,
     duration: TimeDelta,
     url: Option<String>,
     method: Option<String>,
+    response_code: i32,
     server: HashMap<String, RequestValue>,
     request: HashMap<String, RequestValue>,
     cookies: HashMap<String, RequestValue>,
@@ -239,12 +240,12 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
 
     let callstack = FUNCTION_CALLS.with(|calls| std::mem::take(&mut *calls.borrow_mut()));
 
-    let end_timestamp = chrono::Utc::now();
+    let end_time = chrono::Utc::now();
     let profile_data = ProfileData {
-        start_timestamp: request.start_time,
-        end_timestamp,
+        start_time: request.start_time,
+        end_time,
         callstack,
-        duration: end_timestamp.signed_duration_since(request.start_time),
+        duration: end_time.signed_duration_since(request.start_time),
         method: request.method,
         url: request.url,
         cookies: request.cookies,
@@ -252,6 +253,7 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
         post: request.post,
         request: request.request,
         server: request.server,
+        response_code: SapiGlobals::get().sapi_headers.http_response_code,
     };
 
     std::thread::spawn(move || {
