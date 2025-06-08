@@ -11,12 +11,18 @@ use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
     ffi::CStr,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
     time::{Duration, Instant},
 };
-use tokio::{io::AsyncWriteExt as _, net::UnixStream};
+use tokio::{io::AsyncWriteExt as _, net::UnixStream, runtime::Runtime};
 
 mod util;
+
+// Global tokio runtime - reused across requests
+static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 struct ProfileData {
@@ -257,7 +263,13 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
     };
 
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = TOKIO_RT.get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create Tokio runtime")
+        });
+
         rt.block_on(async {
             if let Ok(json) = serde_json::to_string(&profile_data) {
                 if let Ok(mut stream) = UnixStream::connect("/tmp/php-tracking-daemon.sock").await {
