@@ -73,29 +73,29 @@ type StackId = u64;
 
 #[derive(Debug, Clone, Serialize)]
 struct FunctionCall {
-    name: String,
+    name: &'static str,
     stack_id: u64,
     internal: bool,
     duration: Duration,
     parent_stack_id: u64,
-    filename: String,
+    filename: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    namespace: Option<String>,
+    namespace: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     arguments: Vec<ArgumentType>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct MethodCall {
-    name: String,
+    name: &'static str,
     internal: bool,
     stack_id: u64,
-    classname: String,
+    classname: &'static str,
     duration: Duration,
     parent_stack_id: u64,
-    filename: String,
+    filename: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    namespace: Option<String>,
+    namespace: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     arguments: Vec<ArgumentType>,
 }
@@ -170,9 +170,9 @@ pub extern "C" fn request_startup(_type: i32, _module: i32) -> i32 {
                 .http_server_vars()
                 .and_then(|vars| {
                     Some((
-                        vars.get("SERVER_PROTOCOL")?.string()?,
-                        vars.get("HTTP_HOST")?.string()?,
-                        vars.get("REQUEST_URI")?.string()?,
+                        vars.get("SERVER_PROTOCOL")?.str()?,
+                        vars.get("HTTP_HOST")?.str()?,
+                        vars.get("REQUEST_URI")?.str()?,
                     ))
                 })
                 .map(|(protocol, host, uri)| {
@@ -350,11 +350,10 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
             .and_then(|caller| {
                 let op_array = caller.func.as_ref().map(|func| func.op_array)?;
 
-                op_array.filename.as_ref().map(|filename| {
-                    CStr::from_ptr(filename.val.as_ptr())
-                        .to_string_lossy()
-                        .into_owned()
-                })
+                op_array
+                    .filename
+                    .as_ref()
+                    .and_then(|filename| CStr::from_ptr(filename.val.as_ptr()).to_str().ok())
             })
     }) else {
         return;
@@ -362,23 +361,20 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
 
     let internal = unsafe { func.type_ } as u32 == ZEND_INTERNAL_FUNCTION;
 
-    let function_name = unsafe {
-        CStr::from_ptr(name_ptr.val.as_ptr())
-            .to_string_lossy()
-            .into_owned()
+    let Some(function_name) = (unsafe { CStr::from_ptr(name_ptr.val.as_ptr()).to_str().ok() })
+    else {
+        return;
     };
 
     let arguments = unsafe { get_function_arguments(execute_data) };
 
-    let scope = unsafe { func.internal_function.scope.as_ref() }
-        .and_then(|scope| scope.name())
-        .map(|scope| scope.to_owned());
+    let scope = unsafe { func.internal_function.scope.as_ref() }.and_then(|scope| scope.name());
 
     let call = if let Some(scope) = scope {
         let parts: Vec<&str> = scope.rsplitn(2, '\\').collect();
         let (classname, namespace) = match parts.as_slice() {
-            [classname, namespace] => (classname.to_string(), Some(namespace.to_string())),
-            [classname] => (classname.to_string(), None),
+            [classname, namespace] => (*classname, Some(*namespace)),
+            [classname] => (*classname, None),
             _ => return,
         };
 
@@ -529,7 +525,7 @@ fn print_call_tree(calls: &[CallType], parent_id: u64, level: usize) {
                     call.namespace.clone().unwrap_or_default(),
                     call.name,
                     call.duration.as_millis(),
-                    call.filename.clone(),
+                    call.filename,
                     indent = level * 2
                 );
                 print_call_tree(calls, call.stack_id, level + 1);
@@ -539,10 +535,10 @@ fn print_call_tree(calls: &[CallType], parent_id: u64, level: usize) {
                     "{:indent$}└─ {}{}::{} ({}ms) [{}]",
                     "",
                     call.namespace.clone().unwrap_or_default(),
-                    call.classname.clone(),
+                    call.classname,
                     call.name,
                     call.duration.as_millis(),
-                    call.filename.clone(),
+                    call.filename,
                     indent = level * 2
                 );
                 print_call_tree(calls, call.stack_id, level + 1);
