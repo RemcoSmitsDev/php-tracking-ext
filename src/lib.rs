@@ -307,7 +307,19 @@ extern "C" {
 }
 
 #[no_mangle]
-extern "C" fn observer_begin(_: *mut ExecuteData) {
+extern "C" fn observer_begin(execute_data: *mut ExecuteData) {
+    let Some(execute_data_ref) = (unsafe { execute_data.as_ref() }) else {
+        return;
+    };
+
+    let Some(func) = execute_data_ref.function() else {
+        return;
+    };
+
+    if unsafe { func.internal_function.function_name.as_ref() }.is_none() {
+        return;
+    };
+
     ACTIVE_CALLS.with(|calls| {
         let mut calls = calls.borrow_mut();
         calls.push_back(ActiveCall {
@@ -345,8 +357,6 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
     };
 
     let Some(name_ptr) = (unsafe { func.internal_function.function_name.as_ref() }) else {
-        // reduce call stack id for require function calls
-        STACK_ID_COUNTER.fetch_sub(1, Ordering::Relaxed);
         return;
     };
 
