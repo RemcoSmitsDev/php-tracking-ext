@@ -84,7 +84,7 @@ struct FunctionCall {
     internal: bool,
     duration: Duration,
     parent_stack_id: u64,
-    filename: &'static str,
+    filename: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     namespace: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -99,7 +99,7 @@ struct MethodCall {
     classname: &'static str,
     duration: Duration,
     parent_stack_id: u64,
-    filename: &'static str,
+    filename: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     namespace: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -307,19 +307,7 @@ extern "C" {
 }
 
 #[no_mangle]
-extern "C" fn observer_begin(execute_data: *mut ExecuteData) {
-    let Some(execute_data_ref) = (unsafe { execute_data.as_ref() }) else {
-        return;
-    };
-
-    let Some(func) = execute_data_ref.function() else {
-        return;
-    };
-
-    if unsafe { func.internal_function.function_name.as_ref() }.is_none() {
-        return;
-    };
-
+extern "C" fn observer_begin(_: *mut ExecuteData) {
     ACTIVE_CALLS.with(|calls| {
         let mut calls = calls.borrow_mut();
         calls.push_back(ActiveCall {
@@ -360,20 +348,13 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
         return;
     };
 
-    let Some(filename) = (unsafe {
-        execute_data_ref
-            .prev_execute_data
-            .as_ref()
-            .and_then(|caller| {
-                let op_array = caller.func.as_ref().map(|func| func.op_array)?;
-
-                op_array
-                    .filename
-                    .as_ref()
-                    .and_then(|filename| CStr::from_ptr(filename.val.as_ptr()).to_str().ok())
-            })
-    }) else {
-        return;
+    let filename = unsafe {
+        maybe!({
+            let caller = execute_data_ref.prev_execute_data.as_ref()?;
+            let op_array = caller.func.as_ref().map(|func| func.op_array)?;
+            let filename = op_array.filename.as_ref()?;
+            CStr::from_ptr(filename.val.as_ptr()).to_str().ok()
+        })
     };
 
     let internal = unsafe { func.type_ } as u32 == ZEND_INTERNAL_FUNCTION;
@@ -542,7 +523,7 @@ fn print_call_tree(calls: &[CallType], parent_id: u64, level: usize) {
                     call.namespace.clone().unwrap_or_default(),
                     call.name,
                     call.duration.as_millis(),
-                    call.filename,
+                    call.filename.unwrap_or_default(),
                     indent = level * 2
                 );
                 print_call_tree(calls, call.stack_id, level + 1);
@@ -555,7 +536,7 @@ fn print_call_tree(calls: &[CallType], parent_id: u64, level: usize) {
                     call.classname,
                     call.name,
                     call.duration.as_millis(),
-                    call.filename,
+                    call.filename.unwrap_or_default(),
                     indent = level * 2
                 );
                 print_call_tree(calls, call.stack_id, level + 1);
