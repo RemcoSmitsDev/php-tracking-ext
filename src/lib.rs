@@ -274,6 +274,7 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
             if let Ok(json) = serde_json::to_string(&profile_data) {
                 if let Ok(mut stream) = UnixStream::connect("/tmp/php-tracking-daemon.sock").await {
                     let _ = stream.write_all(json.as_bytes()).await;
+                    let _ = stream.flush().await;
                 }
             }
         });
@@ -320,13 +321,11 @@ extern "C" fn observer_begin(_: *mut ExecuteData) {
 extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::ffi::zend_value) {
     let Some((active_call, parent_stack_id)) = ACTIVE_CALLS.with(|calls| {
         let mut calls = calls.borrow_mut();
-        let current = calls.back().cloned();
-        if let Some(active_call) = current {
-            calls.pop_back();
+        if let Some(active_call) = calls.pop_back() {
             let parent_id = calls
                 .back()
                 .map(|active_call| active_call.stack_id)
-                .unwrap_or(0);
+                .unwrap_or(1);
             Some((active_call, parent_id))
         } else {
             None
@@ -337,12 +336,6 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
 
     let elapsed = active_call.start_time.elapsed();
 
-    // reduce amount of calls reported
-    // normally around 27.000 calls for a normal symfony application
-    if elapsed < Duration::from_millis(1) {
-        return;
-    }
-
     let Some(execute_data_ref) = (unsafe { execute_data.as_ref() }) else {
         return;
     };
@@ -352,6 +345,8 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
     };
 
     let Some(name_ptr) = (unsafe { func.internal_function.function_name.as_ref() }) else {
+        // reduce call stack id for require function calls
+        STACK_ID_COUNTER.fetch_sub(1, Ordering::Relaxed);
         return;
     };
 
