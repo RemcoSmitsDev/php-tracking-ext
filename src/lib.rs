@@ -28,15 +28,23 @@ static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
 struct ProfileData {
     start_time: DateTime<Utc>,
     end_time: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     callstack: Vec<CallType>,
     duration: TimeDelta,
+    #[serde(skip_serializing_if = "Option::is_none")]
     url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     method: Option<String>,
     response_code: i32,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     server: HashMap<String, RequestValue>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     request: HashMap<String, RequestValue>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     cookies: HashMap<String, RequestValue>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     get: HashMap<String, RequestValue>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     post: HashMap<String, RequestValue>,
 }
 
@@ -52,6 +60,7 @@ enum RequestValue {
     String(String),
     Bool(bool),
     Int(i64),
+    Float(f64),
     Array(HashMap<String, RequestValue>),
 }
 
@@ -114,7 +123,7 @@ enum CallType {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "lowercase", tag = "type", content = "value")]
+#[serde(untagged)]
 enum ArgumentType {
     Array(String),
     Bool(bool),
@@ -151,6 +160,8 @@ pub extern "C" fn request_startup(_type: i32, _module: i32) -> i32 {
             Some(RequestValue::Bool(value))
         } else if let Some(value) = value.long() {
             Some(RequestValue::Int(value))
+        } else if let Some(value) = value.double() {
+            Some(RequestValue::Float(value))
         } else if let Some(value) = value.array() {
             Some(RequestValue::Array(
                 value
