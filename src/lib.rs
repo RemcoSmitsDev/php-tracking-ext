@@ -1,10 +1,10 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use ext_php_rs::{
-    ffi::{_zval_struct, ZEND_INTERNAL_FUNCTION},
+    ffi::{_zval_struct, zend_ce_throwable, ZEND_INTERNAL_FUNCTION},
     flags::DataType,
     prelude::*,
     types::Zval,
-    zend::{ExecuteData, ProcessGlobals, SapiGlobals},
+    zend::{ClassEntry, ExecuteData, ExecutorGlobals, ProcessGlobals, SapiGlobals},
 };
 use serde::Serialize;
 use std::{
@@ -98,6 +98,7 @@ struct FunctionCall {
     namespace: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     arguments: Vec<ArgumentType>,
+    bubbles_exception: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,6 +114,8 @@ struct MethodCall {
     namespace: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     arguments: Vec<ArgumentType>,
+    bubbles_exception: bool,
+    is_exception: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -377,10 +380,18 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
 
     let arguments = unsafe { get_function_arguments(execute_data) };
 
-    let scope = unsafe { func.internal_function.scope.as_ref() }.and_then(|scope| scope.name());
+    let throwable: Option<&ClassEntry> = unsafe { zend_ce_throwable.as_ref() };
+    let scope: Option<&ClassEntry> = unsafe { func.internal_function.scope.as_ref() };
+    let scope_name = scope.and_then(|scope| scope.name());
 
-    let call = if let Some(scope) = scope {
-        let parts: Vec<&str> = scope.rsplitn(2, '\\').collect();
+    let is_exception = scope
+        .zip(throwable)
+        .is_some_and(|(scope, throwable)| scope.instance_of(throwable));
+
+    let bubbles_exception = ExecutorGlobals::has_exception();
+
+    let call = if let Some(scope_name) = scope_name {
+        let parts: Vec<&str> = scope_name.rsplitn(2, '\\').collect();
         let (classname, namespace) = match parts.as_slice() {
             [classname, namespace] => (*classname, Some(*namespace)),
             [classname] => (*classname, None),
@@ -393,8 +404,10 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
             arguments,
             internal,
             filename,
+            is_exception,
             parent_stack_id,
             duration: elapsed,
+            bubbles_exception,
             name: function_name,
             stack_id: active_call.stack_id,
         })
@@ -406,6 +419,7 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
             namespace: None,
             parent_stack_id,
             duration: elapsed,
+            bubbles_exception,
             name: function_name,
             stack_id: active_call.stack_id,
         })
