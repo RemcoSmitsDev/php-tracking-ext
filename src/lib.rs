@@ -1,6 +1,6 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use ext_php_rs::{
-    ffi::{_zval_struct, zend_ce_throwable, ZEND_INTERNAL_FUNCTION},
+    ffi::{_zval_struct, sapi_headers_struct, zend_ce_throwable, ZEND_INTERNAL_FUNCTION},
     flags::DataType,
     prelude::*,
     types::Zval,
@@ -36,6 +36,8 @@ struct ProfileData {
     #[serde(skip_serializing_if = "Option::is_none")]
     method: Option<String>,
     response_code: i32,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    response_headers: HashMap<String, Option<String>>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     server: HashMap<String, RequestValue>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
@@ -261,6 +263,7 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
     let callstack = FUNCTION_CALLS.with(|calls| std::mem::take(&mut *calls.borrow_mut()));
 
     let end_time = chrono::Utc::now();
+    let sapi_headers = SapiGlobals::get().sapi_headers;
     let profile_data = ProfileData {
         start_time: request.start_time,
         end_time,
@@ -273,7 +276,8 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
         post: request.post,
         request: request.request,
         server: request.server,
-        response_code: SapiGlobals::get().sapi_headers.http_response_code,
+        response_code: sapi_headers.http_response_code,
+        response_headers: response_headers_from_sapi_headers(sapi_headers),
     };
 
     std::thread::spawn(move || {
@@ -451,6 +455,20 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .shutdown_function(shutdown)
         .request_startup_function(request_startup)
         .request_shutdown_function(request_shutdown)
+}
+
+fn response_headers_from_sapi_headers(
+    mut headers: sapi_headers_struct,
+) -> HashMap<String, Option<String>> {
+    headers
+        .headers()
+        .map(|header| {
+            (
+                header.name().to_string(),
+                header.value().map(|value| value.to_string()),
+            )
+        })
+        .collect::<HashMap<String, Option<String>>>()
 }
 
 unsafe fn get_function_arguments(execute_data: *mut ExecuteData) -> Vec<ArgumentType> {
