@@ -449,6 +449,7 @@ pub extern "C" fn register_observer() {
 
 /// Initialize the module and setup function tracking
 #[php_module]
+#[php(startup = "startup")]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
     module
         .startup_function(startup)
