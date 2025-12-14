@@ -95,6 +95,7 @@ struct FunctionCall {
     internal: bool,
     duration: Duration,
     parent_stack_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     filename: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     namespace: Option<&'static str>,
@@ -111,6 +112,7 @@ struct MethodCall {
     classname: &'static str,
     duration: Duration,
     parent_stack_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     filename: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     namespace: Option<&'static str>,
@@ -290,9 +292,14 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
 
         rt.block_on(async {
             if let Ok(json) = serde_json::to_string(&profile_data) {
-                if let Ok(mut stream) = UnixStream::connect("/tmp/php-tracking-daemon.sock").await {
-                    let _ = stream.write_all(json.as_bytes()).await;
-                    let _ = stream.flush().await;
+                match UnixStream::connect("/tmp/php-tracking-daemon.sock").await {
+                    Ok(mut stream) => {
+                        let _ = stream.write_all(json.as_bytes()).await;
+                        let _ = stream.flush().await;
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to connect to daemon: {}", e);
+                    }
                 }
             }
         });
@@ -447,12 +454,10 @@ pub extern "C" fn register_observer() {
     }
 }
 
-/// Initialize the module and setup function tracking
 #[php_module]
 #[php(startup = "startup")]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
     module
-        .startup_function(startup)
         .shutdown_function(shutdown)
         .request_startup_function(request_startup)
         .request_shutdown_function(request_shutdown)
