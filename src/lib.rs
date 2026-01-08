@@ -373,16 +373,21 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
         return;
     };
 
-    let filename = unsafe {
-        maybe!({
-            let caller = execute_data_ref.prev_execute_data.as_ref()?;
-            let op_array = caller.func.as_ref().map(|func| func.op_array)?;
-            let filename = op_array.filename.as_ref()?;
-            CStr::from_ptr(filename.val.as_ptr()).to_str().ok()
-        })
-    };
-
     let internal = unsafe { func.type_ } as u32 == ZEND_INTERNAL_FUNCTION;
+
+    // Get filename from the caller's execute_data (prev_execute_data)
+    let filename = execute_data_ref.previous().and_then(|prev| {
+        prev.function().and_then(|prev_func| {
+            let prev_internal = unsafe { prev_func.type_ } as u32 == ZEND_INTERNAL_FUNCTION;
+            if prev_internal {
+                None
+            } else {
+                unsafe { prev_func.op_array.filename.as_ref() }.and_then(|filename_str| unsafe {
+                    CStr::from_ptr(filename_str.val.as_ptr()).to_str().ok()
+                })
+            }
+        })
+    });
 
     let Some(function_name) = (unsafe { CStr::from_ptr(name_ptr.val.as_ptr()).to_str().ok() })
     else {
