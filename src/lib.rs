@@ -54,6 +54,7 @@ struct ProfileData {
 struct ActiveCall {
     stack_id: StackId,
     start_time: Instant,
+    start_memory: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,6 +96,7 @@ struct FunctionCall {
     internal: bool,
     duration: Duration,
     parent_stack_id: u64,
+    memory_usage: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     filename: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -112,6 +114,7 @@ struct MethodCall {
     classname: &'static str,
     duration: Duration,
     parent_stack_id: u64,
+    memory_usage: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     filename: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -329,15 +332,19 @@ extern "C" {
     pub fn zend_observer_fcall_register(
         callback: extern "C" fn(*mut ExecuteData) -> zend_observer_fcall_handlers,
     );
+
+    pub fn zend_memory_usage(real_usage: bool) -> usize;
 }
 
 #[no_mangle]
 extern "C" fn observer_begin(_: *mut ExecuteData) {
+    let start_memory = unsafe { zend_memory_usage(false) };
     ACTIVE_CALLS.with(|calls| {
         let mut calls = calls.borrow_mut();
         calls.push_back(ActiveCall {
             stack_id: STACK_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
             start_time: Instant::now(),
+            start_memory,
         });
     });
 }
@@ -360,6 +367,8 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
     };
 
     let elapsed = active_call.start_time.elapsed();
+    let end_memory = unsafe { zend_memory_usage(false) };
+    let memory_usage = end_memory as i64 - active_call.start_memory as i64;
 
     let Some(execute_data_ref) = (unsafe { execute_data.as_ref() }) else {
         return;
@@ -421,6 +430,7 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
             internal,
             filename,
             is_exception,
+            memory_usage,
             parent_stack_id,
             duration: elapsed,
             bubbles_exception,
@@ -432,6 +442,7 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
             arguments,
             filename,
             internal,
+            memory_usage,
             namespace: None,
             parent_stack_id,
             duration: elapsed,
@@ -572,11 +583,12 @@ fn print_call_tree(calls: &[CallType], parent_id: u64, level: usize) {
         match call {
             CallType::Function(call) => {
                 println!(
-                    "{:indent$}└─ {}::{} ({}ms) [{}]",
+                    "{:indent$}└─ {}::{} ({}ms) ({}mb) [{}]",
                     "",
                     call.namespace.clone().unwrap_or_default(),
                     call.name,
                     call.duration.as_millis(),
+                    call.memory_usage,
                     call.filename.unwrap_or_default(),
                     indent = level * 2
                 );
@@ -584,12 +596,13 @@ fn print_call_tree(calls: &[CallType], parent_id: u64, level: usize) {
             }
             CallType::Method(call) => {
                 println!(
-                    "{:indent$}└─ {}{}::{} ({}ms) [{}]",
+                    "{:indent$}└─ {}{}::{} ({}ms) ({}mb) [{}]",
                     "",
                     call.namespace.clone().unwrap_or_default(),
                     call.classname,
                     call.name,
                     call.duration.as_millis(),
+                    call.memory_usage,
                     call.filename.unwrap_or_default(),
                     indent = level * 2
                 );
