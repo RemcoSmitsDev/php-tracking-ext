@@ -26,6 +26,7 @@ static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize)]
 struct ProfileData {
+    application_id: String,
     start_time: DateTime<Utc>,
     end_time: DateTime<Utc>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -265,11 +266,16 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
         return 0;
     };
 
+    let Some(application_id) = option_env!("APPLICATION_ID") else {
+        return 0;
+    };
+
     let callstack = FUNCTION_CALLS.with(|calls| std::mem::take(&mut *calls.borrow_mut()));
 
     let end_time = chrono::Utc::now();
     let sapi_headers = SapiGlobals::get().sapi_headers;
     let profile_data = ProfileData {
+        application_id: application_id.to_string(),
         start_time: request.start_time,
         end_time,
         callstack,
