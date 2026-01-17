@@ -409,7 +409,8 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
         return;
     };
 
-    let arguments = unsafe { get_function_arguments(execute_data) };
+    let arguments = Vec::new();
+    // let arguments = unsafe { get_function_arguments(execute_data) };
 
     let throwable: Option<&ClassEntry> = unsafe { zend_ce_throwable.as_ref() };
     let scope: Option<&ClassEntry> = unsafe { func.internal_function.scope.as_ref() };
