@@ -300,10 +300,10 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
         });
 
         rt.block_on(async {
-            if let Ok(json) = serde_json::to_string(&profile_data) {
+            if let Ok(json) = serde_json::to_vec(&profile_data) {
                 match UnixStream::connect("/tmp/php-tracking-daemon.sock").await {
                     Ok(mut stream) => {
-                        let _ = stream.write_all(json.as_bytes()).await;
+                        let _ = stream.write_all(&json).await;
                         let _ = stream.flush().await;
                     }
                     Err(e) => {
