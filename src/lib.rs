@@ -92,16 +92,16 @@ type StackId = u64;
 
 #[derive(Debug, Clone, Serialize)]
 struct FunctionCall {
-    name: &'static str,
+    name: String,
     stack_id: u64,
     internal: bool,
     duration: Duration,
     parent_stack_id: u64,
     memory_usage: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    filename: Option<&'static str>,
+    filename: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    namespace: Option<&'static str>,
+    namespace: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     arguments: Vec<ArgumentType>,
     bubbles_exception: bool,
@@ -109,17 +109,17 @@ struct FunctionCall {
 
 #[derive(Debug, Clone, Serialize)]
 struct MethodCall {
-    name: &'static str,
+    name: String,
     internal: bool,
     stack_id: u64,
-    classname: &'static str,
+    classname: String,
     duration: Duration,
     parent_stack_id: u64,
     memory_usage: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    filename: Option<&'static str>,
+    filename: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    namespace: Option<&'static str>,
+    namespace: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     arguments: Vec<ArgumentType>,
     bubbles_exception: bool,
@@ -398,13 +398,17 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
                 None
             } else {
                 unsafe { prev_func.op_array.filename.as_ref() }.and_then(|filename_str| unsafe {
-                    CStr::from_ptr(filename_str.val.as_ptr()).to_str().ok()
+                    CStr::from_ptr(filename_str.val.as_ptr())
+                        .to_str()
+                        .ok()
+                        .map(|s| s.to_string())
                 })
             }
         })
     });
 
-    let Some(function_name) = (unsafe { CStr::from_ptr(name_ptr.val.as_ptr()).to_str().ok() })
+    let Some(function_name) =
+        (unsafe { CStr::from_ptr(name_ptr.val.as_ptr()).to_str().ok() }).map(|s| s.to_string())
     else {
         return;
     };
@@ -414,7 +418,7 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
 
     let throwable: Option<&ClassEntry> = unsafe { zend_ce_throwable.as_ref() };
     let scope: Option<&ClassEntry> = unsafe { func.internal_function.scope.as_ref() };
-    let scope_name = scope.and_then(|scope| scope.name());
+    let scope_name = scope.and_then(|scope| scope.name()).map(|s| s.to_string());
 
     let is_exception = scope
         .zip(throwable)
@@ -425,8 +429,8 @@ extern "C" fn observer_end(execute_data: *mut ExecuteData, _: *mut ext_php_rs::f
     let call = if let Some(scope_name) = scope_name {
         let parts: Vec<&str> = scope_name.rsplitn(2, '\\').collect();
         let (classname, namespace) = match parts.as_slice() {
-            [classname, namespace] => (*classname, Some(*namespace)),
-            [classname] => (*classname, None),
+            [classname, namespace] => ((*classname).to_string(), Some((*namespace).to_string())),
+            [classname] => ((*classname).to_string(), None),
             _ => return,
         };
 
@@ -596,7 +600,7 @@ fn print_call_tree(calls: &[CallType], parent_id: u64, level: usize) {
                     call.name,
                     call.duration.as_millis(),
                     call.memory_usage,
-                    call.filename.unwrap_or_default(),
+                    call.filename.as_deref().unwrap_or_default(),
                     indent = level * 2
                 );
                 print_call_tree(calls, call.stack_id, level + 1);
@@ -610,7 +614,7 @@ fn print_call_tree(calls: &[CallType], parent_id: u64, level: usize) {
                     call.name,
                     call.duration.as_millis(),
                     call.memory_usage,
-                    call.filename.unwrap_or_default(),
+                    call.filename.as_deref().unwrap_or_default(),
                     indent = level * 2
                 );
                 print_call_tree(calls, call.stack_id, level + 1);
