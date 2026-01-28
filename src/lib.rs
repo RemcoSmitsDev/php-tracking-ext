@@ -32,6 +32,7 @@ struct ProfileData {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     callstack: Vec<CallType>,
     duration: TimeDelta,
+    memory_usage: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -71,6 +72,7 @@ enum RequestValue {
 #[derive(Debug, Clone)]
 struct Request {
     start_time: DateTime<Utc>,
+    start_memory: usize,
     method: Option<String>,
     url: Option<String>,
     server: HashMap<String, RequestValue>,
@@ -190,6 +192,7 @@ pub extern "C" fn request_startup(_type: i32, _module: i32) -> i32 {
     REQUEST.with_borrow_mut(|request| {
         *request = Some(Request {
             start_time: chrono::Utc::now(),
+            start_memory: unsafe { zend_memory_usage(false) },
             method: ProcessGlobals::get()
                 .http_server_vars()
                 .and_then(|vars| vars.get("REQUEST_METHOD"))
@@ -273,6 +276,7 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
     let callstack = FUNCTION_CALLS.with(|calls| std::mem::take(&mut *calls.borrow_mut()));
 
     let end_time = chrono::Utc::now();
+    let end_memory = unsafe { zend_memory_usage(false) };
     let sapi_headers = SapiGlobals::get().sapi_headers;
     let profile_data = ProfileData {
         application_id: application_id.to_string(),
@@ -280,6 +284,7 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
         end_time,
         callstack,
         duration: end_time.signed_duration_since(request.start_time),
+        memory_usage: end_memory.saturating_sub(request.start_memory),
         method: request.method,
         url: request.url,
         cookies: request.cookies,
@@ -504,6 +509,7 @@ fn response_headers_from_sapi_headers(
         .collect::<HashMap<String, Option<String>>>()
 }
 
+#[allow(dead_code)]
 unsafe fn get_function_arguments(execute_data: *mut ExecuteData) -> Vec<ArgumentType> {
     let mut args: Vec<ArgumentType> = Vec::new();
 
