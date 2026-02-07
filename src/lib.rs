@@ -11,20 +11,20 @@ use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
     ffi::CStr,
+    io::Write as _,
     sync::{
         atomic::{AtomicU64, Ordering},
-        OnceLock,
+        mpsc,
     },
     time::{Duration, Instant},
 };
-use tokio::{io::AsyncWriteExt as _, net::UnixStream, runtime::Runtime};
 
 mod util;
 
-// Global tokio runtime - reused across requests
-static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
+const DAEMON_SOCKET_PATH: &str = "/tmp/php-tracking-daemon.sock";
+const SENDER_CHANNEL_CAPACITY: usize = 128;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 struct ProfileData {
     application_id: String,
     start_time: DateTime<Utc>,
@@ -52,14 +52,14 @@ struct ProfileData {
     post: HashMap<String, RequestValue>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ActiveCall {
     stack_id: StackId,
     start_time: Instant,
     start_memory: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum RequestValue {
     String(String),
@@ -69,7 +69,7 @@ enum RequestValue {
     Array(HashMap<String, RequestValue>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Request {
     start_time: DateTime<Utc>,
     start_memory: usize,
@@ -86,13 +86,14 @@ thread_local! {
     static ACTIVE_CALLS: RefCell<VecDeque<ActiveCall>> = RefCell::new(VecDeque::with_capacity(1024));
     static FUNCTION_CALLS: RefCell<Vec<CallType>> = RefCell::new(Vec::new());
     static REQUEST: RefCell<Option<Request>> = RefCell::new(None);
+    static DAEMON_SENDER: RefCell<Option<(u32, mpsc::SyncSender<ProfileData>)>> = RefCell::new(None);
 }
 
 static STACK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type StackId = u64;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 struct FunctionCall {
     name: String,
     stack_id: u64,
@@ -109,7 +110,7 @@ struct FunctionCall {
     bubbles_exception: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 struct MethodCall {
     name: String,
     internal: bool,
@@ -128,14 +129,14 @@ struct MethodCall {
     is_exception: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "lowercase", tag = "type")]
 enum CallType {
     Function(FunctionCall),
     Method(MethodCall),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum ArgumentType {
     Array(String),
@@ -311,30 +312,83 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
         response_headers: response_headers_from_sapi_headers(sapi_headers),
     };
 
-    std::thread::spawn(move || {
-        let rt = TOKIO_RT.get_or_init(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create Tokio runtime")
-        });
-
-        rt.block_on(async {
-            if let Ok(json) = serde_json::to_vec(&profile_data) {
-                match UnixStream::connect("/tmp/php-tracking-daemon.sock").await {
-                    Ok(mut stream) => {
-                        let _ = stream.write_all(&json).await;
-                        let _ = stream.flush().await;
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to connect to daemon: {}", e);
-                    }
-                }
-            }
-        });
-    });
+    send_to_daemon(profile_data);
 
     0
+}
+
+/// Send profile data to the daemon via a background thread.
+///
+/// The PHP worker does a non-blocking `try_send` into an mpsc channel.
+/// A dedicated background thread owns the Unix socket connection and handles
+/// serialization, writing, flushing, and reconnection — completely off the
+/// request path.
+///
+/// Uses PID tracking to safely re-create the sender after PHP-FPM forks.
+fn send_to_daemon(data: ProfileData) {
+    DAEMON_SENDER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let pid = std::process::id();
+
+        // Re-create the sender if this is a new process (post-fork) or first use
+        let needs_init = match *slot {
+            Some((stored_pid, _)) => stored_pid != pid,
+            None => true,
+        };
+
+        if needs_init {
+            let (tx, rx) = mpsc::sync_channel::<ProfileData>(SENDER_CHANNEL_CAPACITY);
+            std::thread::spawn(move || background_sender(rx));
+            *slot = Some((pid, tx));
+        }
+
+        if let Some((_, ref tx)) = *slot {
+            // Non-blocking: if the channel is full the profile is dropped
+            let _ = tx.try_send(data);
+        }
+    });
+}
+
+/// Background thread that owns the daemon socket connection.
+///
+/// Reads `ProfileData` from the channel, serializes to JSON, and writes
+/// newline-delimited messages over a persistent Unix socket. Handles
+/// reconnection transparently.
+fn background_sender(rx: mpsc::Receiver<ProfileData>) {
+    let mut conn: Option<std::os::unix::net::UnixStream> = None;
+
+    while let Ok(profile_data) = rx.recv() {
+        let json = match serde_json::to_vec(&profile_data) {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+
+        // Fast path: reuse existing connection
+        if let Some(ref mut stream) = conn {
+            if stream.write_all(&json).is_ok()
+                && stream.write_all(b"\n").is_ok()
+                && stream.flush().is_ok()
+            {
+                continue;
+            }
+            // Write failed — connection is broken
+            conn = None;
+        }
+
+        // Slow path: establish a new connection and retry
+        match std::os::unix::net::UnixStream::connect(DAEMON_SOCKET_PATH) {
+            Ok(mut stream) => {
+                let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                if stream.write_all(&json).is_ok()
+                    && stream.write_all(b"\n").is_ok()
+                    && stream.flush().is_ok()
+                {
+                    conn = Some(stream);
+                }
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 //
