@@ -76,18 +76,6 @@ php \
   your_script.php
 ```
 
-### Quick test
-
-A test script is included in the `test/` directory:
-
-```sh
-cd test
-php \
-  -d extension=./../target/debug/libphp_tracking_ext.dylib \
-  -d php_tracking.application_id="your-application-uuid-here" \
-  test.php
-```
-
 ## How It Works
 
 1. On **module startup**, the extension registers the `php_tracking.application_id` INI entry and installs a Zend observer to intercept function/method calls.
