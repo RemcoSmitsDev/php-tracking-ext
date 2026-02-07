@@ -1,10 +1,10 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use ext_php_rs::{
     ffi::{_zval_struct, sapi_headers_struct, zend_ce_throwable, ZEND_INTERNAL_FUNCTION},
-    flags::DataType,
+    flags::{DataType, IniEntryPermission},
     prelude::*,
     types::Zval,
-    zend::{ClassEntry, ExecuteData, ExecutorGlobals, ProcessGlobals, SapiGlobals},
+    zend::{ClassEntry, ExecuteData, ExecutorGlobals, IniEntryDef, ProcessGlobals, SapiGlobals},
 };
 use serde::Serialize;
 use std::{
@@ -153,8 +153,15 @@ enum ArgumentType {
 }
 
 #[no_mangle]
-pub extern "C" fn startup(_type: i32, _module: i32) -> i32 {
+pub extern "C" fn startup(_type: i32, module_number: i32) -> i32 {
     register_observer();
+
+    let ini_entries = vec![IniEntryDef::new(
+        "php_tracking.application_id".to_owned(),
+        "".to_owned(),
+        &IniEntryPermission::System,
+    )];
+    IniEntryDef::register(ini_entries, module_number);
 
     0
 }
@@ -269,7 +276,15 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
         return 0;
     };
 
-    let Some(application_id) = option_env!("APPLICATION_ID") else {
+    let ini_values = ExecutorGlobals::get().ini_values();
+    let Some(application_id) = ini_values
+        .get("php_tracking.application_id")
+        .and_then(|v| v.as_ref())
+        .filter(|v| !v.is_empty())
+    else {
+        eprintln!(
+            "Failed to get valid application id from php ini file `php_tracking.application_id`"
+        );
         return 0;
     };
 
@@ -279,7 +294,7 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
     let end_memory = unsafe { zend_memory_usage(false) };
     let sapi_headers = SapiGlobals::get().sapi_headers;
     let profile_data = ProfileData {
-        application_id: application_id.to_string(),
+        application_id: application_id.clone(),
         start_time: request.start_time,
         end_time,
         callstack,
