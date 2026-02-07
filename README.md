@@ -97,5 +97,4 @@ Each profiled request includes:
 - **Call stack** — every function and method call with:
   - Name, class, namespace, filename
   - Duration and memory usage
-  - Arguments (type and value)
   - Exception propagation info
