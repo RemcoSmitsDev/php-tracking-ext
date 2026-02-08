@@ -12,17 +12,17 @@ use std::{
     collections::{HashMap, VecDeque},
     ffi::CStr,
     io::Write as _,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc,
-    },
+    os::fd::AsRawFd as _,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
 mod util;
 
 const DAEMON_SOCKET_PATH: &str = "/tmp/php-tracking-daemon.sock";
-const SENDER_CHANNEL_CAPACITY: usize = 128;
+/// 2 MB send buffer — large enough for most profile payloads to be written in
+/// a single burst without blocking on the daemon to drain the receive side.
+const SOCKET_SEND_BUF_SIZE: libc::c_int = 2 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 struct ProfileData {
@@ -86,7 +86,7 @@ thread_local! {
     static ACTIVE_CALLS: RefCell<VecDeque<ActiveCall>> = RefCell::new(VecDeque::with_capacity(1024));
     static FUNCTION_CALLS: RefCell<Vec<CallType>> = RefCell::new(Vec::new());
     static REQUEST: RefCell<Option<Request>> = RefCell::new(None);
-    static DAEMON_SENDER: RefCell<Option<(u32, mpsc::SyncSender<ProfileData>)>> = RefCell::new(None);
+    static DAEMON_CONNECTION: RefCell<Option<(u32, std::os::unix::net::UnixStream)>> = RefCell::new(None);
 }
 
 static STACK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -317,77 +317,86 @@ pub extern "C" fn request_shutdown(_type: i32, _module: i32) -> i32 {
     0
 }
 
-/// Send profile data to the daemon via a background thread.
+/// Send profile data directly to the daemon over a persistent Unix socket.
 ///
-/// The PHP worker does a non-blocking `try_send` into an mpsc channel.
-/// A dedicated background thread owns the Unix socket connection and handles
-/// serialization, writing, flushing, and reconnection — completely off the
-/// request path.
+/// The connection is kept in thread-local storage and reused across requests
+/// within the same PHP-FPM worker. With a 2 MB `SO_SNDBUF`, most messages
+/// land in kernel space in a single `write` syscall without blocking.
 ///
-/// Uses PID tracking to safely re-create the sender after PHP-FPM forks.
+/// Uses PID tracking to safely re-create the connection after PHP-FPM forks.
 fn send_to_daemon(data: ProfileData) {
-    DAEMON_SENDER.with(|cell| {
+    let mut json = match serde_json::to_vec(&data) {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+
+    // Append newline so we can write everything in a single `write_all` call.
+    // This avoids partial-write corruption where the JSON bytes are flushed
+    // but the newline delimiter is not.
+    json.push(b'\n');
+
+    DAEMON_CONNECTION.with(|cell| {
         let mut slot = cell.borrow_mut();
         let pid = std::process::id();
 
-        // Re-create the sender if this is a new process (post-fork) or first use
+        // After a fork the inherited fd is stale — reconnect.
         let needs_init = match *slot {
             Some((stored_pid, _)) => stored_pid != pid,
             None => true,
         };
 
         if needs_init {
-            let (tx, rx) = mpsc::sync_channel::<ProfileData>(SENDER_CHANNEL_CAPACITY);
-            std::thread::spawn(move || background_sender(rx));
-            *slot = Some((pid, tx));
+            *slot = None;
         }
 
-        if let Some((_, ref tx)) = *slot {
-            // Non-blocking: if the channel is full the profile is dropped
-            let _ = tx.try_send(data);
+        // Fast path: reuse existing connection
+        if let Some((_, ref mut stream)) = *slot {
+            if stream.write_all(&json).is_ok() {
+                return;
+            }
+            // Write failed — connection is broken
+            *slot = None;
+        }
+
+        // Slow path: establish a new connection and retry
+        if let Some(mut stream) = connect_to_daemon() {
+            if stream.write_all(&json).is_ok() {
+                *slot = Some((pid, stream));
+            }
         }
     });
 }
 
-/// Background thread that owns the daemon socket connection.
+/// Open a new connection to the daemon with a large send buffer.
+fn connect_to_daemon() -> Option<std::os::unix::net::UnixStream> {
+    let stream = std::os::unix::net::UnixStream::connect(DAEMON_SOCKET_PATH).ok()?;
+
+    // No write timeout — with the 2 MB SO_SNDBUF most writes complete
+    // instantly. If the daemon is truly stuck the write blocks, which is
+    // correct backpressure. If the daemon dies the OS delivers EPIPE.
+    let _ = stream.set_write_timeout(None);
+
+    // Enlarge the kernel send buffer so large payloads can be written in
+    // one burst without ping-ponging with the daemon.
+    set_send_buffer_size(&stream);
+
+    Some(stream)
+}
+
+/// Ask the kernel to enlarge the send buffer on `stream`.
 ///
-/// Reads `ProfileData` from the channel, serializes to JSON, and writes
-/// newline-delimited messages over a persistent Unix socket. Handles
-/// reconnection transparently.
-fn background_sender(rx: mpsc::Receiver<ProfileData>) {
-    let mut conn: Option<std::os::unix::net::UnixStream> = None;
-
-    while let Ok(profile_data) = rx.recv() {
-        let json = match serde_json::to_vec(&profile_data) {
-            Ok(j) => j,
-            Err(_) => continue,
-        };
-
-        // Fast path: reuse existing connection
-        if let Some(ref mut stream) = conn {
-            if stream.write_all(&json).is_ok()
-                && stream.write_all(b"\n").is_ok()
-                && stream.flush().is_ok()
-            {
-                continue;
-            }
-            // Write failed — connection is broken
-            conn = None;
-        }
-
-        // Slow path: establish a new connection and retry
-        match std::os::unix::net::UnixStream::connect(DAEMON_SOCKET_PATH) {
-            Ok(mut stream) => {
-                let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
-                if stream.write_all(&json).is_ok()
-                    && stream.write_all(b"\n").is_ok()
-                    && stream.flush().is_ok()
-                {
-                    conn = Some(stream);
-                }
-            }
-            Err(_) => {}
-        }
+/// With the default ~8 KB buffer a 500 KB message requires dozens of
+/// write-block-drain round-trips. A 2 MB buffer lets most messages land in
+/// kernel space in a single `write` syscall.
+fn set_send_buffer_size(stream: &std::os::unix::net::UnixStream) {
+    unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &SOCKET_SEND_BUF_SIZE as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
     }
 }
 

@@ -923,6 +923,7 @@ dependencies = [
  "chrono",
  "ext-php-rs",
  "lazy_static",
+ "libc",
  "parking_lot",
  "serde",
  "serde_json",
